@@ -94,9 +94,17 @@ def test_a_dreams_cycle_trains_on_practice_only(dreams):
     # Recorded so an adopted Dream can take these lessons out of the prompt.
     assert store.nights()[-1]["record"]["trained_signals"] == ["sig0", "sig1", "sig2"]
     assert store.get("learning_mode") == "dreams"
-    # Rejected by the gate, but the scenes count as practised.
+    # Rejected by the gate: nothing was adopted, so the scenes are not
+    # practised. On their own they wait (the same Dream would be rejected
+    # again); with a new scene they are all trained again.
+    assert store.get("practice_revisions", {}) == {}
+    assert set(store.get(practice_pool.REJECTED)) == set(trained)
     assert worker.run(config, store)["reason"] == "Waiting for new learnable experience"
     assert practice_pool.untrained(store) == []
+    add_practice(store, 1, start=10)
+    again = practice_pool.untrained(store)
+    assert {s["id"] for s in again} >= set(trained)
+    assert [s["id"] for s in again if not s.get("retry")] == ["practice:sig10#v1"]
 
 
 def test_practice_beyond_the_cap_waits_for_the_next_dream(dreams):
@@ -110,9 +118,12 @@ def test_practice_beyond_the_cap_waits_for_the_next_dream(dreams):
     worker.run(config, store)
     (trained,) = Model.pools
     assert len(trained) == 4
-    left = {s["id"] for s in practice_pool.untrained(store)}
-    assert len(left) == total - 4 and not left & set(trained)
-    # The next Dream trains from what is left.
+    left = practice_pool.untrained(store)
+    untried = {s["id"] for s in left if not s.get("retry")}
+    assert len(untried) == total - 4 and not untried & set(trained)
+    # Rejected, so the first four are still to train, after the untried ones.
+    assert {s["id"] for s in left if s.get("retry")} == set(trained)
+    # The next Dream trains from what no Dream has tried.
     worker.run(config, store)
     assert not set(Model.pools[1]) & set(trained)
 
@@ -125,19 +136,67 @@ async def test_new_practice_starts_the_next_cycle(dreams):
     add_practice(store, 1, start=10)
     assert await scheduler.enough()
     worker.run(config, store)
-    # New first; older scenes come back only as replay.
+    # The new scene, and with it the scenes of the rejected Dream, in full.
     assert "practice:sig10#v1" in Model.pools[-1]
+    assert set(Model.pools[0]) <= set(Model.pools[-1])
 
 
 def test_switching_from_hindsight_does_not_hide_practice(dreams):
+    from songe.steps import revision_id
+
     config, store = dreams
     # An installation that trained on real steps: its watermark counts
     # exchange ids, far above practice row numbers.
     store.set("experience_watermark", 5000)
     store.set("practice_revisions", {"x": 4000})
+    # Rejections counted under another mode say nothing either.
+    store.set(practice_pool.REJECTED, {s["id"]: [revision_id(s), 2] for s in practice_pool.practice_steps(store)})
     assert len(practice_pool.untrained(store)) == 3
     worker.run(config, store)
     assert len(Model.pools[-1]) == 3
+    assert {times for _, times in practice_pool.rejected(store).values()} == {1}
+
+
+def add_trainable(store, start):
+    """One new scene of a lesson that is not held out; the next free number."""
+    while practice_pool.held_out(f"sig{start}"):
+        start += 1
+    add_practice(store, 1, start=start)
+    return start + 1
+
+
+def test_a_scene_three_dreams_trained_without_adoption_counts_as_practised(dreams):
+    """A scene that keeps failing the gate is not trained in full by every
+    later Dream until something is adopted: on its third Dream that is not
+    adopted it counts as practised and comes back as replay only."""
+    config, store = dreams
+    worker.run(config, store)
+    first = set(Model.pools[-1])
+    free = 10
+    for times in (1, 2):
+        assert store.get("practice_revisions", {}) == {}
+        assert {n for scene, (_, n) in practice_pool.rejected(store).items() if scene in first} == {times}
+        free = add_trainable(store, free)
+        worker.run(config, store)
+        assert first <= set(Model.pools[-1])
+    assert set(store.get("practice_revisions", {})) == first
+    assert sorted(n for _, n in practice_pool.rejected(store).values()) == [1, 2]
+    add_trainable(store, free)
+    left = {s["id"]: s.get("retry", False) for s in practice_pool.untrained(store)}
+    assert not set(left) & first and sorted(left.values()) == [False, True, True]
+
+
+def test_a_new_learning_window_starts_without_rejected_scenes(dreams):
+    from songe.models import registry
+
+    config, store = dreams
+    registry.migrate(config, store)
+    registry.observe(config, store, "learner")
+    learner = store.scoped("learner")
+    learner.set("practice_revisions", {"practice:a#v1": 3})
+    learner.set(practice_pool.REJECTED, {"practice:b#v1": [4, 1]})
+    registry.set_learning(store, "learner", "all")
+    assert learner.get("practice_revisions") is None and learner.get(practice_pool.REJECTED) is None
 
 
 def test_the_cycle_records_which_drift_measure_gated(dreams):

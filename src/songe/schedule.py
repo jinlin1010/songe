@@ -1418,7 +1418,15 @@ class Scheduler:
                             "Update could not be loaded by the model server"
                         )
                         self.store.night(night["id"], status="rejected", record=record)
-                        self.store.set("experience_watermark", record["watermark"])
+                        if self.store.get("learning_mode", "hindsight") == "dreams":
+                            # Not adopted, so not practised: under Dreams the
+                            # watermark counts practice scenes, and moving it
+                            # hid this Dream's scenes from every later one.
+                            from .practice.pool import keep_for_retry
+
+                            keep_for_retry(self.store, record.get("practice_revisions") or {})
+                        else:
+                            self.store.set("experience_watermark", record["watermark"])
                     else:
                         self.store.night(night["id"], record=record)
                     self.state = "awake"

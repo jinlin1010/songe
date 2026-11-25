@@ -163,10 +163,18 @@ def test_scenes_are_written_up_to_the_target_and_go_with_their_signal(store):
 
 
 def test_forget_deletes_practice(store):
+    from songe.practice.pool import REJECTED
+
     written(store)
+    # Scene ids start again after forgetting: what a rejected Dream trained
+    # must not match the new ones (they were then never untrained).
+    other = store.scoped("another-model")
+    for view in (store, other):
+        view.set(REJECTED, {"practice:x#v1": [3, 1]})
     store.forget()
     with store.connect() as db:
         assert db.execute("SELECT COUNT(*) FROM practice").fetchone()[0] == 0
+    assert store.get(REJECTED) is None and other.get(REJECTED) is None
 
 
 def test_not_copy_catches_non_latin_verbatim_requests():

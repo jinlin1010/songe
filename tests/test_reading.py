@@ -182,6 +182,33 @@ def test_an_example_of_the_question_pasted_back_is_not_the_users_wish():
     assert P.turn_verdict({"standing": "yes", "kind": "once", "wish": "Use metric units."}, "everything in metric")[0] == "lasting"
 
 
+def test_words_the_user_put_in_quotation_marks_are_not_cut_off(store):
+    """Live (Qwen3.5-4B on vLLM, structured output): a JSON string ends at the
+    first double quote the model does not escape, and it copied the user's."""
+    said = 'Always start your reply with "Yes, chef."'
+
+    def as_json_string(text):
+        return text.split('"')[0]  # what structured output leaves of it
+
+    class Copying(FakeReader):
+        async def ask(self, prompt, schema, name):
+            answer = await super().ask(prompt, schema, name)
+            if name == "classify":
+                text = prompt.rsplit("New user message:\n", 1)[1].split("\n")[0]
+                return {"parts": [{"says_something_is_wrong": True, "kind": "feedback", "type": "correction",
+                                   "text": as_json_string(text)}]}
+            if name == "turn":
+                text = prompt.rsplit("The user's next message:\n", 1)[1].split("\n")[0]
+                return {"standing": "yes", "kind": "once", "wish": as_json_string(text)}
+            return answer
+
+    record_session(store, reply_text=said)
+    read(store, Copying())
+    wish = next(s for s in reading.signals(store) if s["type"] == "correction" and s.get("turn_kind"))
+    assert wish["text"] == said  # the user's exact words, with their marks
+    assert wish["lesson"] == "Always start your reply with 'Yes, chef.'"
+
+
 def test_what_the_turn_was_is_kept_with_its_signals(store):
     record_session(store, reply_text="make it shorter")
 
@@ -1207,6 +1234,55 @@ def test_a_new_preference_retires_the_one_it_replaces(config, store):
     assert [s["preference"] for s in reading.signals(store) if s.get("preference")] == [other, new]
     quick.quick_dream(store, config)
     assert {lesson["text"] for lesson in quick.active(store)} == {other, new}
+
+
+class Repeating(Changing):
+    """Also asked which kept notes a new note could repeat (the numbers given
+    for it) and whether two notes are one wish (the pairs given are)."""
+
+    def __init__(self, about_me=(), same=None, one_wish=(), **changes):
+        super().__init__(about_me, **changes)
+        self.same, self.one_wish, self.one_way, self.listed, self.pairs = same or {}, set(one_wish), set(), [], []
+
+    async def ask(self, prompt, schema, name):
+        if name == "same_note":
+            self.listed.append(prompt)
+            return {"same": self.same.get(prompt.split("A new note:\n", 1)[1].split("\n")[0], [])}
+        if name == "same_wish":
+            pair = (prompt.split("Note 1: ", 1)[1].split("\n")[0], prompt.split("Note 2: ", 1)[1].split("\n")[0])
+            self.pairs.append(pair)
+            return {"note_1_asks": pair[0], "note_2_asks": pair[1], "kind": "same" if pair in self.one_wish or pair[::-1] in self.one_wish - self.one_way else "different"}
+        return await super().ask(prompt, schema, name)
+
+
+def test_a_preference_said_again_shares_one_place_and_a_changed_one_still_leaves(config, store):
+    """A preference said again in other words is not a change of mind and not
+    a second preference: both sentences stay, word for word, in one place.
+    A preference that replaces an earlier one still retires it, and that is
+    settled first: folding only sees what is still true of the user."""
+    from songe import quick
+    from songe.reading import prompts as P
+
+    dairy, again = "I avoid dairy.", "I avoid milk and cheese."
+    window, aisle = "I prefer window seats when I fly.", "I prefer aisle seats now."
+    record_chat(store, (f"{dairy} What can I cook tonight?", "A lentil curry."))
+    record_chat(store, (f"{window} Find me a flight to Oslo.", "The 9:40 has window seats."))
+    record_chat(store, (f"{again} Any dessert ideas?", "A fruit salad."))
+    record_chat(store, (f"{aisle} Find me a flight to Rome.", "The 7:15 has aisle seats."))
+    reader = Repeating(
+        about_me={dairy, again, window, aisle}, replaces={aisle: [2]}, not_both={(window, aisle)},
+        same={again: [1], aisle: [1]}, one_wish={(dairy, again)},
+    )
+    assert read(store, reader) == 4
+    assert [s["preference"] for s in reading.signals(store)] == [dairy, again, aisle]
+    # The retired sentence is not among the notes shown; the seat preference
+    # the model named for the dairy note is a different wish, and stays apart.
+    assert reader.listed == [P.SAME.format(notes=f"1. {dairy}", note=again), P.SAME.format(notes=f"1. {dairy}", note=aisle)]
+    assert reader.pairs == [(dairy, again), (again, dairy), (dairy, aisle)]
+    quick.quick_dream(store, config)
+    lessons = {lesson["text"]: lesson for lesson in quick.active(store)}
+    assert set(lessons) == {f"{again} {dairy}", aisle}
+    assert lessons[f"{again} {dairy}"]["count"] == 2 and lessons[f"{again} {dairy}"]["rule"]
 
 
 def test_the_order_conversations_are_read_in_does_not_decide_which_preference_stays(config, store):
