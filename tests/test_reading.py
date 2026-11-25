@@ -303,6 +303,33 @@ def test_voiced_is_the_share_of_content_words_the_user_wrote():
     assert voiced("Answer.", "restart the duel") == 1  # no content word to compare
 
 
+def test_words_the_user_put_in_quotation_marks_are_not_cut_off(store):
+    """Live (Qwen3.5-4B on vLLM, structured output): a JSON string ends at the
+    first double quote the model does not escape, and it copied the user's."""
+    said = 'Always start your reply with "Yes, chef."'
+
+    def as_json_string(text):
+        return text.split('"')[0]  # what structured output leaves of it
+
+    class Copying(FakeReader):
+        async def ask(self, prompt, schema, name):
+            answer = await super().ask(prompt, schema, name)
+            if name == "classify":
+                text = prompt.rsplit("New user message:\n", 1)[1].split("\n")[0]
+                return {"parts": [{"says_something_is_wrong": True, "kind": "feedback", "type": "correction",
+                                   "text": as_json_string(text)}]}
+            if name == "turn":
+                text = prompt.rsplit("The user's next message:\n", 1)[1].split("\n")[0]
+                return {"standing": "yes", "kind": "once", "wish": as_json_string(text)}
+            return answer
+
+    record_session(store, reply_text=said)
+    read(store, Copying())
+    wish = next(s for s in reading.signals(store) if s["type"] == "correction" and s.get("turn_kind"))
+    assert wish["text"] == said  # the user's exact words, with their marks
+    assert wish["lesson"] == "Always start your reply with 'Yes, chef.'"
+
+
 def test_what_the_turn_was_is_kept_with_its_signals(store):
     record_session(store, reply_text="make it shorter")
 
@@ -421,6 +448,34 @@ def test_the_client_falls_back_when_structured_output_is_refused(store):
     assert first == second == {"steps": [1], "reason": "r"}
     assert len(bodies) == 2  # refused once, asked plainly once; then cached
     assert reader.cached == 1
+
+
+def test_the_client_asks_for_a_plain_reply_the_way_a_user_does(store):
+    """reply(): the served model's next message in a conversation, with no
+    schema and none of the reasoning switches the reader's questions set."""
+    sent = []
+
+    def server(request):
+        sent.append(json.loads(request.content))
+        message = {"role": "assistant", "content": "uv add numpy"}
+        if len(sent) == 2:
+            message["reasoning"] = "The user wants uv."
+        return httpx.Response(200, json={"choices": [{"message": message, "finish_reason": "stop"}]})
+
+    reader = Reader(store, "http://x/v1", "m", server="vllm",
+                    client=httpx.AsyncClient(transport=httpx.MockTransport(server)))
+    messages = [{"role": "user", "content": "How do I add numpy?"}]
+    first = asyncio.run(reader.reply(messages, max_tokens=384))
+    assert first == {"content": "uv add numpy", "finished": True, "reasoned": False}
+    assert sent[0] == {"model": "m", "messages": messages, "temperature": 0, "max_tokens": 384, "stream": False}
+    # A server that reasons first says so (either field name, or <think> text).
+    assert asyncio.run(reader.reply(messages, max_tokens=384))["reasoned"] is True
+    away = Reader(store, "http://x/v1", "m", still_idle=lambda: False, client=reader.client)
+    try:
+        asyncio.run(away.reply(messages, max_tokens=384))
+    except Stopped:
+        return
+    raise AssertionError("expected Stopped")
 
 
 def test_the_client_stops_when_the_user_returns(store):
@@ -752,7 +807,9 @@ async def test_a_failing_practice_scene_is_retried_then_skipped_and_only_repeate
     signals_ = [({"id": f"s{i}", "session": "x", "lesson": "L."}, [1]) for i in range(5)]
     monkeypatch.setattr(ps, "RETRY_WAITS", (0, 0))
     monkeypatch.setattr(ps, "wanted", lambda store, n: signals_)
-    monkeypatch.setattr(ps, "source", lambda store, s: ({"messages": [{"role": "user", "content": "hi"}]}, []))
+    # An agent's request (it has tools): each scene is written on its own.
+    request = {"messages": [{"role": "user", "content": "hi"}], "tools": TOOLS}
+    monkeypatch.setattr(ps, "source", lambda store, s: (request, []))
     saved = []
     monkeypatch.setattr(ps, "save", lambda store, row: saved.append(row["id"]))
     calls = {}
@@ -1340,6 +1397,55 @@ def test_a_new_preference_retires_the_one_it_replaces(config, store):
     assert [s["preference"] for s in reading.signals(store) if s.get("preference")] == [other, new]
     quick.quick_dream(store, config)
     assert {lesson["text"] for lesson in quick.active(store)} == {other, new}
+
+
+class Repeating(Changing):
+    """Also asked which kept notes a new note could repeat (the numbers given
+    for it) and whether two notes are one wish (the pairs given are)."""
+
+    def __init__(self, about_me=(), same=None, one_wish=(), **changes):
+        super().__init__(about_me, **changes)
+        self.same, self.one_wish, self.one_way, self.listed, self.pairs = same or {}, set(one_wish), set(), [], []
+
+    async def ask(self, prompt, schema, name):
+        if name == "same_note":
+            self.listed.append(prompt)
+            return {"same": self.same.get(prompt.split("A new note:\n", 1)[1].split("\n")[0], [])}
+        if name == "same_wish":
+            pair = (prompt.split("Note 1: ", 1)[1].split("\n")[0], prompt.split("Note 2: ", 1)[1].split("\n")[0])
+            self.pairs.append(pair)
+            return {"note_1_asks": pair[0], "note_2_asks": pair[1], "kind": "same" if pair in self.one_wish or pair[::-1] in self.one_wish - self.one_way else "different"}
+        return await super().ask(prompt, schema, name)
+
+
+def test_a_preference_said_again_shares_one_place_and_a_changed_one_still_leaves(config, store):
+    """A preference said again in other words is not a change of mind and not
+    a second preference: both sentences stay, word for word, in one place.
+    A preference that replaces an earlier one still retires it, and that is
+    settled first: folding only sees what is still true of the user."""
+    from songe import quick
+    from songe.reading import prompts as P
+
+    dairy, again = "I avoid dairy.", "I avoid milk and cheese."
+    window, aisle = "I prefer window seats when I fly.", "I prefer aisle seats now."
+    record_chat(store, (f"{dairy} What can I cook tonight?", "A lentil curry."))
+    record_chat(store, (f"{window} Find me a flight to Oslo.", "The 9:40 has window seats."))
+    record_chat(store, (f"{again} Any dessert ideas?", "A fruit salad."))
+    record_chat(store, (f"{aisle} Find me a flight to Rome.", "The 7:15 has aisle seats."))
+    reader = Repeating(
+        about_me={dairy, again, window, aisle}, replaces={aisle: [2]}, not_both={(window, aisle)},
+        same={again: [1], aisle: [1]}, one_wish={(dairy, again)},
+    )
+    assert read(store, reader) == 4
+    assert [s["preference"] for s in reading.signals(store)] == [dairy, again, aisle]
+    # The retired sentence is not among the notes shown; the seat preference
+    # the model named for the dairy note is a different wish, and stays apart.
+    assert reader.listed == [P.SAME.format(notes=f"1. {dairy}", note=again), P.SAME.format(notes=f"1. {dairy}", note=aisle)]
+    assert reader.pairs == [(dairy, again), (again, dairy), (dairy, aisle)]
+    quick.quick_dream(store, config)
+    lessons = {lesson["text"]: lesson for lesson in quick.active(store)}
+    assert set(lessons) == {f"{again} {dairy}", aisle}
+    assert lessons[f"{again} {dairy}"]["count"] == 2 and lessons[f"{again} {dairy}"]["rule"]
 
 
 def test_the_order_conversations_are_read_in_does_not_decide_which_preference_stays(config, store):

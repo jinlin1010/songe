@@ -28,6 +28,18 @@ from .views import (
 SIGNAL_TYPES = ("correction", "retry", "approval", "tool_error", "failed_result", "outcome")
 
 
+def in_json(text):
+    """The user's words as the model is shown them where it copies them into
+    a JSON string: straight double quotation marks as single ones.
+
+    Structured output ends a string at the first double quote that is not
+    escaped, so a sentence that quoted the user came back cut there (live,
+    Qwen3.5-4B on vLLM: for 'Always start your reply with "Yes, chef."' the
+    feedback part was "Always start your reply with " and the wish "Always
+    start your reply with", which became a lesson)."""
+    return str(text).replace('"', "'")
+
+
 def tools_of(rows):
     """The agent's tool descriptions, as sent with its requests."""
     for _, request, _, _ in rows:
@@ -258,7 +270,7 @@ class Session:
             P.LESSON.format(
                 task=self.task_text(item),
                 steps=self.short(shown),
-                feedback=self.short(text[:1500]) + about,
+                feedback=in_json(self.short(text[:1500])) + about,
                 reason=signal["reason"],
                 after=self.after_view(item),
                 # The user's own words can hold a wish to keep as they said it.
@@ -293,12 +305,17 @@ class Session:
                     P.CLASSIFY.format(
                         earlier=self.short("\n".join(user_messages(items, e["item"]))),
                         steps=self.short(step_lines(items, turn + 1, e["item"])),
-                        message=e["text"],
+                        message=in_json(e["text"]),
                     ),
                     P.CLASSIFY_SCHEMA,
                     "classify",
                 )
                 parts = [p for p in answer.get("parts") or [] if isinstance(p, dict)]
+                for p in parts:
+                    # A part is the user's exact words: with their own marks again.
+                    at = in_json(e["text"]).find(p["text"]) if isinstance(p.get("text"), str) and p["text"] else -1
+                    if at >= 0:
+                        p["text"] = e["text"][at : at + len(p["text"])]
                 # What the turn is, judged on its own: a standing wish about
                 # how this user wants things, a change wanted once, new work,
                 # or a reaction. A standing wish the split above did not read
@@ -309,7 +326,7 @@ class Session:
                         P.TURN.format(
                             earlier=self.short("\n".join(user_messages(items, e["item"]))),
                             steps=self.short(step_lines(items, turn + 1, e["item"])),
-                            message=e["text"],
+                            message=in_json(e["text"]),
                         ),
                         P.TURN_SCHEMA,
                         "turn",
