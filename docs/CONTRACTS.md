@@ -75,7 +75,8 @@ or by auto-dream:
   within `quick_read_seconds` (the older backlog is left to Deep), then
   publishes the prompt lessons (`quick.py`): lessons read as applying to any
   task, and rules the user stated (a sentence of theirs that starts like a
-  rule, used verbatim and kept first); other feedback waits for Deep Dream.
+  rule, used verbatim and kept first); other lessons with the evidence a note
+  needs (see practice below) wait for Deep Dream.
   Reading writes each lesson twice: `lesson` (one or two sentences, the Deep
   Dream teacher's note) and `short` (one instruction of at most 15 words, the
   prompt's form); Quick Dream uses `short`, and trims `lesson` by text only for
@@ -156,6 +157,16 @@ or by auto-dream:
   wrote, checked in code (`rules.voiced`): one that names nothing the user
   wrote is not used, and the user's own sentence, when the message is one
   short sentence, is the note or the lesson in its place.
+- Practice needs the same evidence as a note (`quick.admitted`, one bar for
+  both; training is harder to undo than a note). Where the user's turn was
+  judged, Deep Dream writes scenes for a standing wish and for a rule of
+  theirs at once, for a change wanted once only when the same wish has come
+  up in a second conversation, and for nothing the user took out of the
+  prompt. The bar is about evidence, not about what a lesson applies to: a
+  lesson too narrow for the prompt (one kind of task), or one from the work
+  itself (a tool's output), is practised as before. Scenes already written
+  for a lesson that does not meet the bar are kept and not trained
+  (`practice.pool.not_admitted`).
 - Deep Dream (2–3 hours, skills): reads what is left, writes practice, trains,
   checks. When one is adopted, the lessons whose signals it trained leave the
   prompt (`quick.absorb`); an undo lets them come back.

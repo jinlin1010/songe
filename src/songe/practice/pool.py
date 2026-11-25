@@ -51,10 +51,13 @@ def practice_steps(store, split="train"):
             (store.model_id,),
         ).fetchall()
     extra = set(store.get(EXTRA_HELD_OUT) or [])
+    waiting = not_admitted(store) if rows else set()
     steps = []
     for rowid, payload, tools in rows:
         row = json.loads(payload)
         if not row.get("messages") or held_out(row["signal_id"], extra) != (split == "held_out"):
+            continue
+        if row["signal_id"] in waiting:
             continue
         steps.append(
             {
@@ -75,6 +78,18 @@ def practice_steps(store, split="train"):
             }
         )
     return steps
+
+
+def not_admitted(store):
+    """Ids of the lesson signals that may not be learned now (quick.admitted
+    is the rule): a one-off correction that has not come up again, a lesson
+    the user took out of the prompt. Their scenes, written by an earlier
+    version or before the note was removed, are kept and not trained."""
+    from ..reading.store import signals
+    from .store import LESSON_TYPES, lesson_signals
+
+    allowed = {s["id"] for s in lesson_signals(store)}
+    return {s["id"] for s in signals(store, types=LESSON_TYPES) if s["id"] not in allowed}
 
 
 def practice_revisions(store):

@@ -39,9 +39,11 @@ def reply(message):
     return {"choices": [{"message": message}]}
 
 
-def record_session(store, *, more=False, started=None, reply_text="No, you changed the wrong file."):
+def record_session(store, *, more=False, started=None, reply_text="No, you changed the wrong file.",
+                   ask="fix the failing test"):
     """Ask, run the tests (1 failed), edit, run again (passed), done; then the
-    user corrects. With more=True the session continues one more turn."""
+    user corrects. With more=True the session continues one more turn. Another
+    `ask` makes another conversation (the same opening is the same one)."""
     t1 = {"role": "assistant", "content": "", "tool_calls": [call("a", "shell", command="pytest")]}
     r1 = {"role": "tool", "tool_call_id": "a", "content": "1 failed, 2 passed\nExit code: 1"}
     t2 = {"role": "assistant", "content": "", "tool_calls": [call("b", "edit", filePath="x.py", oldString="a", newString="b")]}
@@ -49,7 +51,7 @@ def record_session(store, *, more=False, started=None, reply_text="No, you chang
     t3 = {"role": "assistant", "content": "", "tool_calls": [call("c", "shell", command="pytest")]}
     r3 = {"role": "tool", "tool_call_id": "c", "content": "3 passed\nExit code: 0"}
     done = {"role": "assistant", "content": "Fixed."}
-    user = {"role": "user", "content": "fix the failing test"}
+    user = {"role": "user", "content": ask}
     history = [SYSTEM, user]
     for action, result in ((t1, r1), (t2, r2), (t3, r3)):
         store.record("/v1/chat/completions", {"messages": history, "tools": TOOLS}, reply(action), started=started)
@@ -556,7 +558,10 @@ async def test_idle_reading_uses_the_learners_own_loaded_model(config, store, mo
     registry.migrate(config, store)
     registry.observe(config, store, "learner")
     registry.set_learning(store, "learner", "all")
+    # The correction in two conversations: wanted once, it is a lesson to
+    # practise only when it comes up again.
     record_session(store)
+    record_session(store, ask="fix the other failing test")
     learner = store.scoped("learner")
     scheduler, asked = scheduler_for(config, store, monkeypatch, loaded=["someone-else"])
     assert await scheduler.read_sessions() == 0  # its own model is not loaded
@@ -565,9 +570,9 @@ async def test_idle_reading_uses_the_learners_own_loaded_model(config, store, mo
     from songe.practice import store as practice
 
     # Short pauses only read; practice is Deep Dream's first step.
-    assert await scheduler.read_sessions() == 1
+    assert await scheduler.read_sessions() == 2
     assert practice.counts(learner)["written"] == 0
-    # Deep: 3 scenes for its one lesson (the correction).
+    # Deep: 3 scenes for its one lesson (the correction, said twice).
     assert await scheduler.read_sessions(practice=True) == 3
     assert {model for model, _ in asked} == {"learner"}
     assert {s["type"] for s in reading.signals(learner)} == {"correction", "success"}
@@ -791,8 +796,10 @@ def test_practice_is_written_for_the_users_rules_first(store):
 
     with store.connect() as db:
         for i, origin in enumerate([None, None, "rules"]):
+            # The stated rule in the user's words: only a sentence shaped like a rule is one.
             payload = {"id": f"s{i}", "session": "x", "type": "correction", "source": "user", "lesson": f"Lesson {i}.",
-                       "exchanges": {"1": 1}, "revision": 1, **({"from": origin} if origin else {})}
+                       "exchanges": {"1": 1}, "revision": 1,
+                       **({"from": origin, "text": "Always run the tests before a commit."} if origin else {})}
             db.execute("INSERT INTO signals VALUES (?,?,?,?,?,NULL)", (f"s{i}", store.model_id, "x", 1, json.dumps(payload)))
     assert [s["id"] for s, _ in wanted(store, 1)][0] == "s2"
 
