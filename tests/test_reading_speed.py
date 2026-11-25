@@ -75,6 +75,54 @@ async def test_a_cut_off_answer_is_forced_from_the_reasoning_so_far(store):
     await reader.close()
 
 
+async def test_a_server_that_refuses_the_thinking_cap_is_asked_without_it(store):
+    """Live (vLLM 0.34.0 serving Mistral-7B-Instruct-v0.2 and TinyLlama with
+    the server's defaults, so without --reasoning-parser): every reader
+    question was answered 400 "thinking_token_budget is set but
+    reasoning_config is not configured". The reader took the first refusal for
+    "no structured output", asked plainly, was refused again, and no session
+    was ever read (20 of 20 stores, an hour each)."""
+    sent = []
+
+    def server(request):
+        body = json.loads(request.content)
+        sent.append(body)
+        if "thinking_token_budget" in body:
+            return httpx.Response(400, json={"error": {
+                "message": "thinking_token_budget is set but reasoning_config is not configured. Please set "
+                           "--reasoning-parser and/or --reasoning-config to use thinking_token_budget.",
+                "type": "BadRequestError", "param": None, "code": 400}})
+        return httpx.Response(200, json={
+            "choices": [{"finish_reason": "stop", "message": {"content": json.dumps({"kind": "about_me"})}}],
+            "usage": {"completion_tokens": 8}})
+
+    reading_client.NO_BUDGET.clear()
+    transport = httpx.MockTransport(server)
+    reader = reading_client.Reader(store, "http://plain/v1", "m", server="vllm",
+                                   client=httpx.AsyncClient(transport=transport))
+    assert await reader.ask("is this about the user?", {"type": "object"}, "preference") == {"kind": "about_me"}
+    # Refused once, asked again without the cap; structured output is kept.
+    assert [("thinking_token_budget" in b, "response_format" in b) for b in sent] == [(True, True), (False, True)]
+    assert reader.structured
+    await reader.ask("another question", {"type": "object"}, "review")
+    assert len(sent) == 3 and "thinking_token_budget" not in sent[-1]
+    # The other thinking controls are sent as before.
+    assert sent[-1]["chat_template_kwargs"] == {"enable_thinking": False} and sent[-1]["reasoning_effort"] == "none"
+    await reader.close()
+    # A later reading of the same server and model starts without the cap;
+    # another server is still asked with it.
+    again = reading_client.Reader(store, "http://plain/v1", "m", server="vllm",
+                                  client=httpx.AsyncClient(transport=transport))
+    await again.ask("a third question", {"type": "object"}, "review")
+    assert len(sent) == 4 and "thinking_token_budget" not in sent[-1]
+    await again.close()
+    other = reading_client.Reader(store, "http://model/v1", "m", server="vllm",
+                                  client=httpx.AsyncClient(transport=transport))
+    assert other.budget
+    await other.close()
+    reading_client.NO_BUDGET.clear()
+
+
 async def test_a_moment_still_unreadable_when_forced_is_given_up_and_remembered(store):
     sent = []
 

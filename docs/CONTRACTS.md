@@ -80,7 +80,9 @@ or by auto-dream:
   Dream teacher's note) and `short` (one instruction of at most 15 words, the
   prompt's form); Quick Dream uses `short`, and trims `lesson` by text only for
   signals read before `short` existed.
-  Published lessons keep their wording; near-duplicates as one,
+  Published lessons keep their wording; near-duplicates as one, and so are
+  notes reading found to be one wish said in other words (the place then
+  keeps each wording, see `same_notes` below),
   most recurrent then most recent first; the served model then consolidates
   them in one call (merges same-meaning lessons, drops ones that fit only one
   kind of task, rewrites each as one short instruction; the candidates as they
@@ -130,6 +132,19 @@ or by auto-dream:
   practice no longer see it, and it stays retired when its conversation is
   read again. The order conversations are read in does not matter; answers
   come from the reader's cache unless the list of earlier sentences changed.
+- People repeat themselves. Then each note for the prompt is shown to the
+  served model with the notes before it, oldest first (`same_note`: which of
+  them could be the same wish?), and each one it names again with it alone,
+  both ways round (`same_wish`: the model says each note again as an
+  instruction, then "same" or "different"). A note that repeats an earlier
+  one both times ("Celsius
+  please, I don't think in Fahrenheit." after "In metric please.") is folded
+  into it (`same_notes` in the learner's state: signal -> the first signal of
+  that wish). Folded notes are one lesson and take one place in the prompt,
+  which keeps each wording, the most recent first, as long as they fit in one
+  lesson; a change wanted once counts in every conversation it came up in,
+  however it was worded. No wording is chosen and no signal is retired, so a
+  wrong answer costs a place or shares one and never drops a note.
 - Every user message that follows an answer is judged once by the served
   model (`turn`, with thinking): a standing wish about how this user wants
   things, a change wanted for this answer only, new work, or a reaction. Only
@@ -858,6 +873,17 @@ both orders, must find that the answer with the note does what the user's
 feedback asks. On a server whose reasoning leaves no room for those answers
 they are asked again with reasoning switched off, then with more room. Real contexts are never trained on;
 replay draws from earlier practice scenes. Anchors and the gate are unchanged.
+
+A scene counts as practised once a Deep Dream that trained it is adopted
+(`practice_revisions`). A Dream that is not adopted, rejected by the gate or
+never loaded by the model server, practised nothing: its scenes are kept under
+`rejected_practice` and trained again, in full, by the next Dream that has a
+new scene, after the scenes no Dream has tried when the Dream is capped. On
+their own they wait, since the same scenes alone would be rejected again. A
+scene trained by three Dreams that were not adopted counts as practised from
+then on and comes back as replay only. Forgetting, a change of a model's
+learning level and a switch of learning mode clear `rejected_practice` together
+with `practice_revisions`.
 
 References: [Thinking Machines, On-Policy Distillation (2025)](https://thinkingmachines.ai/blog/on-policy-distillation/);
 [OPSD (2601.18734)](https://arxiv.org/abs/2601.18734);

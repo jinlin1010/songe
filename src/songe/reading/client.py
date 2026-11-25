@@ -29,6 +29,8 @@ FORCE_CONTEXT = 6000
 FORCE_TOKENS = 4096
 # Asked of every reader question.
 BRIEF = "\nKeep your reasoning short. Answer with the JSON only."
+# (server url, model) that refused thinking_token_budget: not sent it again.
+NO_BUDGET = set()
 
 
 class Stopped(Exception):
@@ -87,6 +89,9 @@ class Reader:
         self.forced = self.cut_off = self.tokens_out = 0
         self.seconds = 0.0
         self.structured = True
+        # vLLM takes thinking_token_budget only when it was started with a
+        # reasoning parser (see send); a server that refused it is remembered.
+        self.budget = (self.url, self.model) not in NO_BUDGET
 
     def log_stats(self, stage):
         """What a stage cost so far (cumulative), for comparing models and
@@ -138,7 +143,7 @@ class Reader:
             # writes its answer (probed live on Inkling-2-Mini: 1,024 halved
             # the generated tokens and the time, JSON complete). Effort "none"
             # alone did not bound reasoning on long prompts (~8,100 tokens).
-            if self.server == "vllm":
+            if self.server == "vllm" and self.budget:
                 body["thinking_token_budget"] = THINKING_BUDGET[think]
         started = time.monotonic()
         # max_tokens caps the reasoning and the answer together: a model that
@@ -224,20 +229,41 @@ class Reader:
             ),
         }
 
+    async def send(self, payload):
+        """One request to the model server. vLLM started without a reasoning
+        parser refuses thinking_token_budget (400, "thinking_token_budget is
+        set but reasoning_config is not configured"): the same question is
+        asked again without the cap, and the cap is left out for this server
+        and model from then on. Live (vLLM 0.34.0, Mistral-7B-Instruct-v0.2
+        and TinyLlama-1.1B-Chat, the server's defaults): every reader question
+        was refused, the first refusal was taken for "no structured output",
+        the plain question was refused as well, and no session was ever read."""
+        capped = "thinking_token_budget" in payload
+        if capped and not self.budget:
+            payload = {k: v for k, v in payload.items() if k != "thinking_token_budget"}
+            capped = False
+        response = await self.client.post(self.url + "/chat/completions", json=payload)
+        if capped and response.status_code == 400 and "thinking_token_budget" in response.text:
+            self.budget = False
+            NO_BUDGET.add((self.url, self.model))
+            logger.info("reader_no_thinking_budget the model server refused thinking_token_budget; asking without it")
+            payload = {k: v for k, v in payload.items() if k != "thinking_token_budget"}
+            response = await self.client.post(self.url + "/chat/completions", json=payload)
+        return response
+
     async def post(self, body, prompt, schema, name):
         """One question: (answer, finish reason, generated tokens, reasoning
         text). Structured output when the
         server takes it, else asked plainly with the schema in the prompt."""
         if self.structured:
-            response = await self.client.post(
-                self.url + "/chat/completions",
-                json=body
+            response = await self.send(
+                body
                 | {
                     "response_format": {
                         "type": "json_schema",
                         "json_schema": {"name": name, "strict": True, "schema": schema},
                     }
-                },
+                }
             )
             if 400 <= response.status_code < 500:
                 # This server does not take structured output; ask plainly.
@@ -245,9 +271,8 @@ class Reader:
             else:
                 response.raise_for_status()
                 return read(response), finish_reason(response), usage(response), reasoning_of(response)
-        response = await self.client.post(
-            self.url + "/chat/completions",
-            json=body
+        response = await self.send(
+            body
             | {
                 "messages": [
                     {
@@ -255,7 +280,7 @@ class Reader:
                         "content": prompt + "\nThe JSON must match this schema: " + json.dumps(schema),
                     }
                 ]
-            },
+            }
         )
         response.raise_for_status()
         return read(response), finish_reason(response), usage(response), reasoning_of(response)
