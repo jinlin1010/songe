@@ -359,6 +359,8 @@ def test_the_users_own_rule_and_no_padding(config, store):
     assert quick.tidy("Always verify file paths before writing files.") == "Check file paths before writing files."
     assert quick.tidy("Always ensure that tests pass.") == "Make sure tests pass."
     assert quick.tidy(quick.tidy("Always verify that x works.")) == quick.tidy("Always verify that x works.")
+    # A note in the user's own words can be a question: it keeps its mark.
+    assert quick.tidy("Can you drop the em dashes?") == "Can you drop the em dashes?"
 
 
 def test_only_a_rule_shaped_sentence_of_the_users_counts(config, store):

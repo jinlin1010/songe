@@ -157,6 +157,10 @@ or by auto-dream:
   or missing while the turn question read new work or a question (a
   reminder: "Where's my ...?") waits the same way. Other new work and
   reactions do not become notes. A sentence shaped like a rule stays a rule.
+  The wish and the lesson for such a message are the model's wording of what
+  the user wrote, checked in code (`rules.voiced`): one that names nothing
+  the user wrote is not used, and the user's own sentence, when the message
+  is one short sentence, is the note or the lesson in its place.
 - Practice needs the same evidence as a note (`quick.admitted`, one bar for
   both; training is harder to undo than a note). Where the user's turn was
   judged, Deep Dream writes scenes for a standing wish and for a rule of

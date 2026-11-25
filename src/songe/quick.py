@@ -422,7 +422,8 @@ def shorten(text):
         # A cut that leaves a fragment ("Check that the program entry point")
         # is worse than a long lesson: keep the whole first sentence.
         text = first.rstrip(" ,.:-")
-    return text + "."
+    # A user's own sentence can end as a question ("Can you drop the em dashes?").
+    return text if text.endswith(("?", "!")) else text + "."
 
 
 def tidy(text):

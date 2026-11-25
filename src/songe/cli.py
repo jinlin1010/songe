@@ -328,6 +328,19 @@ def initialize(args, root):
                 ids = upstream_model_ids(url)
             except (OSError, ValueError, httpx.HTTPError):
                 continue
+            swap_note = None
+            swapped = discovery.llamaswap_loaded(url) if name == "llamacpp" else None
+            if swapped is not None:
+                # llama-swap without weights Songe can read, and a llama.cpp
+                # setup without Songe's own endpoint would fail only at
+                # publish, after training: forward until init sees some.
+                name = None
+                swap_note = (
+                    "llama-swap's loaded models name no weights Songe can read"
+                    " (an absolute -m path to a .gguf file)"
+                    if swapped
+                    else "llama-swap has no model loaded · run songe init again while one runs"
+                )
             # An embedding model can never chat: not offered to agents (#72).
             ids = [i for i in ids if not embedding_name(i)]
             if ids:
@@ -351,6 +364,9 @@ def initialize(args, root):
                         ("Data", str(root)),
                         ("Service", service_fact(args)),
                         ("Replace", "loaded copy when a better version is ready"),
+                        *(
+                            [("Learning", swap_note)] if swap_note else []
+                        ),
                     ]
                 )
                 console().print()
@@ -453,15 +469,22 @@ def initialize(args, root):
 
     # A model already offered under its songe/ name is not added again.
     offered = set(config.exposed_models)
+    swapped = (
+        llamaswap_offered(config, endpoints.get((ref.upstream, ref.serving_id)))
+        if ref.upstream == "llamacpp"
+        else []
+    )
     config.exposed_models = list(
         dict.fromkeys(
             [
                 *config.exposed_models,
                 *(
-                    r.serving_id
-                    for r in catalog_refs
-                    if r.upstream == ref.upstream
-                    and public_name(r.serving_id) not in offered
+                    serving_id
+                    for serving_id in [
+                        *(r.serving_id for r in catalog_refs if r.upstream == ref.upstream),
+                        *swapped,
+                    ]
+                    if public_name(serving_id) not in offered
                 ),
             ]
         )
@@ -589,6 +612,10 @@ def initialize(args, root):
         rows.append(("Learning", "new conversations · starts when idle"))
     if config.server_owned:
         rows.append(("Server", f"{server} · {config.upstream_url}"))
+        binary = (config.server_command or [""])[0]
+        if config.upstream == "llamacpp" and not (shutil.which(binary) or Path(binary).is_file()):
+            # llama-swap's own llama-server is not one Songe can start.
+            rows.append(("Learned", "need llama-server on PATH to be served"))
     if commands:
         rows.append(("Download", "training runtime"))
     rows.append(("Replace", "loaded copy when a better version is ready"))
@@ -687,6 +714,22 @@ def initialize(args, root):
         config, args, root, changes,
         lambda: agents.proposed(config, default=default_choice(args), opencode_v2=v2, root=root),
     )
+
+
+def llamaswap_offered(config, endpoint=None):
+    """llama-swap's chat models, loaded or not: they are offered too and
+    forwarded, and their weights are found once llama-swap runs them."""
+    from .models import discovery
+    from .models.library import embedding_name
+
+    # On re-init upstream_url is Songe's own port; llama-swap is the source.
+    url = endpoint or config.server_source_url or config.upstream_url
+    try:
+        ids = discovery.llamaswap_models(url)
+    except (httpx.HTTPError, ValueError):
+        return []
+    # An embedding model can never chat: not offered to agents (#72).
+    return [i for i in ids if not embedding_name(i)]
 
 
 def preenable_model(args, root, config, ref, refs):

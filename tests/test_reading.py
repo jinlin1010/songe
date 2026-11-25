@@ -238,6 +238,129 @@ def test_an_example_of_the_question_pasted_back_is_not_the_users_wish():
     assert P.turn_verdict({"standing": "yes", "kind": "once", "wish": "Use metric units."}, "everything in metric")[0] == "lasting"
 
 
+def test_a_wish_that_says_nothing_the_user_wrote_is_not_used():
+    """Live (Qwen3.5-4B): the turn question returned the wish "Speak French."
+    for a user who wrote 'Always start your reply with "Yes, chef."'."""
+    from songe.reading import prompts as P
+
+    said, cat = 'Always start your reply with "Yes, chef."', "[U1] What's a good name for a cat?"
+    french = {"standing": "yes", "kind": "once", "wish": "Speak French."}
+    # The model's wording is dropped; the user's own message is the note.
+    assert P.turn_verdict(french, said, cat) == ("lasting", said)
+    # Several sentences (which one is the wish?), too long to stay whole as a
+    # note, or a single word: no wish from this question.
+    assert P.turn_verdict(french, "That was wrong. " + said, cat) == ("lasting", "")
+    assert P.turn_verdict(french, "start your reply with yes chef and " + "then go on " * 8, cat) == ("lasting", "")
+    assert P.turn_verdict(french, "again", cat) == ("lasting", "")
+    # Words that only point back at the conversation are left off the note.
+    assert P.own_words("Same thing without the comments.") == "Without the comments."
+    assert P.own_words("Same thing but no em dashes please.") == "No em dashes please."
+    assert P.own_words("Again, properly.") == ""
+    # A wish worded from the user's words stays as the model worded it,
+    # also when the user said it in an earlier message of the conversation.
+    chef = {"standing": "yes", "kind": "once", "wish": "Start every reply with 'Yes, chef.'"}
+    assert P.turn_verdict(chef, said, cat) == ("lasting", chef["wish"])
+    assert P.turn_verdict(chef, "Again, properly.", f"{cat}\n[U2] {said}") == ("lasting", chef["wish"])
+    # One word of an earlier message is not enough. Live: a page pasted
+    # earlier had a button in it, and a remark about quotation marks came
+    # back as the question's own example.
+    green = {"standing": "yes", "kind": "once", "wish": "Make the buttons green."}
+    quotes = "you output the wrong type of quotations"
+    assert P.turn_verdict(green, quotes, '[U1] <button class="buy">Buy</button>') == ("lasting", quotes)
+    russian = {"standing": "yes", "kind": "task", "wish": "Answer in Russian."}
+    assert P.turn_verdict(russian, "i want in russian") == ("lasting", "Answer in Russian.")
+    # One of the user's words is enough for a wish: this one is right.
+    imperial = {"standing": "yes", "kind": "task", "wish": "Use imperial units, not metric."}
+    assert P.turn_verdict(imperial, "why are you giving me answers in the metric system") == ("lasting", imperial["wish"])
+
+
+class Guessing(FakeReader):
+    """Judges every turn a change wanted once and writes the lesson given."""
+
+    def __init__(self, lesson, turn=None):
+        super().__init__()
+        self.lesson, self.turn = lesson, turn or {"standing": "no", "kind": "once", "wish": ""}
+
+    async def ask(self, prompt, schema, name):
+        answer = await super().ask(prompt, schema, name)
+        if name == "lesson":
+            return dict(answer, lesson=self.lesson, short=self.lesson, generality="always")
+        return self.turn if name == "turn" else answer
+
+
+def test_a_lesson_that_guesses_what_was_wrong_with_an_answer_is_no_lesson(store):
+    """Live (Qwen3.5-4B, a plain chat): "Just the code." was stored as the
+    lesson below, and a Deep Dream practised it."""
+    record_chat(store, ("Write a bash one-liner that counts the lines in every .py file here.", "Sure! Here it is: ..."),
+                ("Just the code.", "find . -name '*.py' | xargs wc -l"))
+    read(store, Guessing("Always include the exact file pattern requested by the user."))
+    guess = next(s for s in reading.signals(store) if s["type"] == "correction")
+    # The user wanted the answer changed: their own words are the lesson.
+    assert (guess["turn_kind"], guess["lesson"], guess["short"], guess["unvoiced"]) == ("once", "Just the code.", "Just the code.", True)
+
+
+@pytest.mark.parametrize("kind", ["task", "reaction"])
+def test_a_guess_about_a_turn_that_asked_for_no_change_is_no_lesson(store, kind):
+    record_chat(store, ("When was the first iPhone released?", "It was announced on January 9, 2007."),
+                ("And the first iPad?", "April 3, 2010."))
+    # The split finds feedback but nothing wrong in it, as for a follow-up
+    # question: the turn question's verdict stands (a part that says something
+    # is wrong after a plain answer would wait like a change wanted once).
+    reader = Guessing("Always use the public availability date, not the announcement date.", {"standing": "no", "kind": kind, "wish": ""})
+    ask = reader.ask
+
+    async def nothing_wrong(prompt, schema, name):
+        answer = await ask(prompt, schema, name)
+        if name == "classify":
+            answer = {"parts": [dict(p, says_something_is_wrong=False) for p in answer["parts"]]}
+        return answer
+
+    reader.ask = nothing_wrong
+    read(store, reader)
+    guess = next(s for s in reading.signals(store) if s["type"] == "correction")
+    assert (guess["lesson"], guess["short"], guess["unvoiced"]) == (None, None, True)
+    from songe.practice.store import lesson_signals
+    assert lesson_signals(store) == []  # nothing to practise
+
+
+def test_a_lesson_in_the_users_words_stays(store):
+    record_chat(store, ("Write a bash one-liner that counts the lines in every .py file here.", "Sure! Here it is: ..."),
+                ("Just the code.", "find . -name '*.py' | xargs wc -l"))
+    read(store, Guessing("Write just the code."))
+    kept = next(s for s in reading.signals(store) if s["type"] == "correction")
+    assert kept["lesson"] == kept["short"] == "Write just the code." and "unvoiced" not in kept
+
+
+def test_a_lesson_about_what_the_agent_did_need_not_be_in_the_users_words(store):
+    # After tool calls the lesson is about the agent's steps: "No, you changed
+    # the wrong file." says nothing of tests, and the advice stays.
+    record_session(store)
+    read(store, Guessing("Check which file the failing test covers before editing."))
+    advice = next(s for s in reading.signals(store) if s["type"] == "correction")
+    assert advice["lesson"].startswith("Check which file") and "unvoiced" not in advice
+
+
+def test_a_wish_the_model_invented_is_stored_in_the_users_own_words(store):
+    said = 'Always start your reply with "Yes, chef."'
+    record_chat(store, ("What's a good name for a cat?", "Whiskers."), (said, "Yes, chef. Whiskers."))
+    read(store, Guessing("Always confirm the direct answer first.", {"standing": "yes", "kind": "once", "wish": "Speak French."}))
+    wish = next(s for s in reading.signals(store) if s["type"] == "correction")
+    assert wish["turn_kind"] == "lasting" and wish["lesson"] == wish["short"] == said
+
+
+def test_voiced_is_the_share_of_content_words_the_user_wrote():
+    from songe.reading.rules import voiced
+
+    assert voiced("Answer in Russian.", "i want in russian") == 1
+    assert voiced("Do not apologize.", "can you stop apologizing all the time") == 1  # endings ignored
+    assert voiced("Use Polars, not pandas.", "no pandas, polars only") == 1
+    assert voiced("Speak French.", 'Always start your reply with "Yes, chef."') == 0
+    assert voiced("Always use the public availability date, not the announcement date.", "Date as 2007-06-29 please.") == 0.25
+    assert voiced("Always include the requested phrase exactly as the user named it.", "You forgot the 'Yes, chef.'") == 0
+    assert voiced("Answer in Chinese.", "请用中文回答") == 1  # words cannot show it
+    assert voiced("Answer.", "restart the duel") == 1  # no content word to compare
+
+
 def test_words_the_user_put_in_quotation_marks_are_not_cut_off(store):
     """Live (Qwen3.5-4B on vLLM, structured output): a JSON string ends at the
     first double quote the model does not escape, and it copied the user's."""
@@ -1162,13 +1285,30 @@ def test_a_preference_said_after_an_answer_is_published_as_the_user_said_it(conf
     from songe import quick
 
     said = "I'm allergic to peanuts."
+
+    class Allergic(Judge):
+        async def ask(self, prompt, schema, name):
+            answer = await super().ask(prompt, schema, name)
+            return dict(answer, lesson="Never suggest peanuts: the user is allergic.") if name == "lesson" else answer
+
     record_chat(store, ("Suggest a snack.", "Peanut butter on toast."), (f"{said} Anything else works.", "Apple slices."))
-    assert read(store, Judge(about_me={said})) == 1
+    assert read(store, Allergic(about_me={said})) == 1
     # One signal: the model's reading of the message, which now carries the sentence.
     (signal,) = [s for s in reading.signals(store) if s["source"] == "user"]
-    assert signal["preference"] == said and signal["lesson"].startswith("Check which file")
+    assert signal["preference"] == said and signal["lesson"].startswith("Never suggest peanuts")
     quick.quick_dream(store, config)
     assert [lesson["text"] for lesson in quick.active(store)] == [said]
+
+
+def test_a_preference_whose_lesson_was_a_guess_is_practised_in_the_users_words(store):
+    # The lesson the model wrote for the message says nothing the user said
+    # (the canned one is about a failing test): it is dropped, and the
+    # sentence is the lesson a Deep Dream practises.
+    said = "I'm allergic to peanuts."
+    record_chat(store, ("Suggest a snack.", "Peanut butter on toast."), (f"{said} Anything else works.", "Apple slices."))
+    read(store, Judge(about_me={said}))
+    kept = [s for s in reading.signals(store) if s["source"] == "user" and s.get("lesson")]
+    assert [(s["lesson"], s.get("preference")) for s in kept] == [(said, said)]
 
 
 def test_not_every_sentence_in_the_first_person_is_a_preference(config, store):

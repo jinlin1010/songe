@@ -8,6 +8,8 @@ they were checked against a hand-labelled answer key):
 - lesson: what to do differently, how general that is, how success is checked
 """
 
+import re
+
 TYPES = ["correction", "retry", "approval"]
 
 CLASSIFY_SCHEMA = {
@@ -291,10 +293,44 @@ Answer with JSON only."""
 TURN_EXAMPLE_NAMES = ("chinese", "polars", "pandas", "jquery", "linux")
 
 
-def turn_verdict(answer, message=""):
+# A lead-in that only points back at the conversation: a note is read without it.
+BACK = re.compile(r"^(same thing|same|again)\b[\s,]*((but|and)\s+)?", re.I)
+
+
+def own_words(message):
+    """The user's message as a note in their own words, or "" when it cannot
+    be one: a single word, several sentences (which of them is the wish is
+    not known), or longer than a note is left whole (quick.SHORT). Words
+    that only point back at the conversation are left off: "Same thing
+    without the comments." is noted as "Without the comments." (live: asked
+    whether that note and "uv please." are one wish, the model read "same
+    thing" as uv and put both in one place of the prompt)."""
+    from .rules import SENTENCES
+
+    own = " ".join(str(message).split())
+    if len(own) > 90 or len(SENTENCES.split(own)) != 1:
+        return ""
+    rest = BACK.sub("", own)
+    own = own if rest == own else rest[:1].upper() + rest[1:]
+    return own if len(own.split()) > 1 else ""
+
+
+def turn_verdict(answer, message="", earlier=""):
     """("lasting", the wish as a note) or ("once" | "task" | "reaction", "")
     from the answer to TURN about this message; (None, "") when the model
-    gave none."""
+    gave none. `earlier` is what the user wrote before it in the conversation.
+
+    The wish is the model's wording of what the user said, so it has to name
+    something this message names (rules.voiced), or the user has to have said
+    all of it earlier in the conversation ("Again, properly."). Live
+    (Qwen3.5-4B): 'Always start your reply with "Yes, chef."' came back as
+    the wish "Speak French.", was kept as the lesson and practised by a Deep
+    Dream; a remark about quotation marks came back as the question's own
+    example "Make the buttons green.", and a page pasted earlier had a
+    button in it. Such a wish is not used: the note is then the user's own
+    message, when that is one short sentence (own_words)."""
+    from .rules import voiced
+
     if not isinstance(answer, dict):
         return None, ""
     kind = answer.get("kind") if answer.get("kind") in ("once", "task", "reaction") else None
@@ -303,7 +339,11 @@ def turn_verdict(answer, message=""):
     wish, said = " ".join(str(answer.get("wish") or "").split()), message.lower()
     if said.isascii() and any(name in wish.lower() and name not in said for name in TURN_EXAMPLE_NAMES):
         return kind, ""
-    return "lasting", wish if 12 <= len(wish) <= 140 else ""
+    if not 12 <= len(wish) <= 140:
+        return "lasting", ""
+    if not voiced(wish, message) and voiced(wish, f"{earlier}\n{message}") < 1:
+        return "lasting", own_words(message)
+    return "lasting", wish
 
 
 # Asked about a sentence the rules flagged as a possible preference of the
