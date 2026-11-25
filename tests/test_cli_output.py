@@ -421,3 +421,27 @@ def test_flow_states_use_dashboard_units():
         "collecting · 0 of 8 new examples"
     )
     assert flow_state("LM Studio busy") == "LM Studio busy"
+
+
+def test_non_utf8_stdio_streams_do_not_crash(tmp_path, monkeypatch):
+    out_buf = io.BytesIO()
+    err_buf = io.BytesIO()
+    monkeypatch.setattr(
+        cli.sys,
+        "stdout",
+        io.TextIOWrapper(out_buf, encoding="gbk", errors="strict"),
+    )
+    monkeypatch.setattr(
+        cli.sys,
+        "stderr",
+        io.TextIOWrapper(err_buf, encoding="cp1252", errors="strict"),
+    )
+    monkeypatch.setattr(cli.LocalClient, "control", lambda *a, **kw: None)
+    monkeypatch.setattr(cli.LocalClient, "running", lambda self: False)
+    args = ["--data-dir", str(tmp_path / "data")]
+    assert cli.main(args + ["pause"]) == 0
+    assert cli.main(args + ["open"]) == 1
+    cli.sys.stdout.flush()
+    cli.sys.stderr.flush()
+    assert "✓ Learning paused" in out_buf.getvalue().decode("utf-8")
+    assert "✗ Songe is stopped" in err_buf.getvalue().decode("utf-8")
