@@ -650,10 +650,19 @@ class Scheduler:
                 or size.get("max_teacher_sequence", float("inf")) >= shortest
             )
 
-        if not retrying and fits(
-            choose_size(config, calibration, after_unload(before, reclaimable), history)
-        ):
+        size = choose_size(config, calibration, after_unload(before, reclaimable), history)
+        if not retrying and fits(size):
             return None
+        if size and not fits(size):
+            # Training would fit, but no teacher length the examples need
+            # was measured: measure it rather than wait for memory (#140).
+            from .sleep.calibration_state import teacher_to_ask
+
+            asked = teacher_to_ask(config, calibration, store, size)
+            if asked is not None:
+                store.set("calibration", asked)
+                self.last_fit = None
+                return "Measuring memory for longer conversations"
         needed = free_needed(config, calibration, before, history, fits)
         self.last_fit = (before, needed)  # for note_fit_wait
         return waiting_reason(before, history, needed)
@@ -1056,7 +1065,8 @@ class Scheduler:
                         self.reason = wait
                         # The wait a pressed Deep Dream is in before training
                         # (live: the page showed nothing for it).
-                        self.note_fit_wait(*self.last_fit)
+                        if self.last_fit:
+                            self.note_fit_wait(*self.last_fit)
                         return
                 if unloads:
                     wait = park_wait(
@@ -1082,7 +1092,12 @@ class Scheduler:
 
                 training_platform = TrainingPlatform(self.platform, self.config)
                 sample = await asyncio.to_thread(snapshot, training_platform)
-                from .sleep.sizing import choose_size, free_needed, waiting_reason
+                from .sleep.sizing import (
+                    choose_size,
+                    free_needed,
+                    gigabytes,
+                    waiting_reason,
+                )
 
                 self.observe_memory(sample)
                 sizing = (
@@ -1110,18 +1125,46 @@ class Scheduler:
                         shortest is not None
                         and sizing.get("max_teacher_sequence", float("inf")) < shortest
                     ):
+                        from .sleep.calibration_state import teacher_to_ask
+                        from .sleep.sizing import teacher_card_shortfall
+
+                        asked = teacher_to_ask(
+                            self.config,
+                            self.store.get("calibration") or {},
+                            self.store,
+                            sizing,
+                        )
+                        if asked is not None:
+                            # No teacher of the length these examples need was
+                            # measured (the ladder jumped over it): measure it
+                            # instead of deferring them on every slice (#140).
+                            self.store.set("calibration", asked)
+                            self.reason = "Measuring memory for longer conversations"
+                            await self.restore()
+                            return
+                        needed = free_needed(
+                            self.config,
+                            calibration,
+                            sample,
+                            self.pressure_history.data,
+                            lambda s: s.get("max_teacher_sequence", 0) >= shortest,
+                        )
+                        card = teacher_card_shortfall(calibration, sample, shortest)
                         self.reason = waiting_reason(
                             sample,
                             self.pressure_history.data,
-                            free_needed(
-                                self.config,
-                                calibration,
-                                sample,
-                                self.pressure_history.data,
-                                lambda s: s.get("max_teacher_sequence", 0) >= shortest,
+                            needed,
+                            what="intact training samples deferred"
+                            + (
+                                f" · the graphics card needs {gigabytes(card)} more free"
+                                if card
+                                else ""
                             ),
-                            what="intact training samples deferred",
                         )
+                        # Measured and still too big beside what else runs: a
+                        # pressed Dream ends with a note instead of retrying
+                        # without end.
+                        self.note_fit_wait(sample, needed)
                         self.unload_retry_at = time.monotonic() + RETRY_FIRST_SECONDS
                         await self.restore()
                         return
@@ -1375,7 +1418,15 @@ class Scheduler:
                             "Update could not be loaded by the model server"
                         )
                         self.store.night(night["id"], status="rejected", record=record)
-                        self.store.set("experience_watermark", record["watermark"])
+                        if self.store.get("learning_mode", "hindsight") == "dreams":
+                            # Not adopted, so not practised: under Dreams the
+                            # watermark counts practice scenes, and moving it
+                            # hid this Dream's scenes from every later one.
+                            from .practice.pool import keep_for_retry
+
+                            keep_for_retry(self.store, record.get("practice_revisions") or {})
+                        else:
+                            self.store.set("experience_watermark", record["watermark"])
                     else:
                         self.store.night(night["id"], record=record)
                     self.state = "awake"
@@ -1530,6 +1581,7 @@ class ModelScheduler(Scheduler):
         self.serving_model = None
         self.load_refused = {}
         self.serving_binding = None
+        self.answered_running = False
         super().__init__(config, store, upstream, platform)
 
     def unloads(self):
@@ -2361,6 +2413,16 @@ class ModelScheduler(Scheduler):
             refs = await asyncio.to_thread(
                 registry.discover, self.installation_config, self.upstream
             )
+            waiting = set()
+            if self.installation_config.upstream == "llamacpp":
+                from .models import discovery
+
+                config = self.installation_config
+                waiting = await asyncio.to_thread(
+                    discovery.llamaswap_waiting,
+                    config.server_source_url or config.upstream_url,
+                    getattr(self.upstream, "transport", None),
+                )
         except (OSError, ValueError, RuntimeError, KeyError, httpx.HTTPError) as exc:
             # A server that is down or answers oddly leaves the models pending
             # for a later tick; it must never end the tick (issue #8).
@@ -2368,7 +2430,13 @@ class ModelScheduler(Scheduler):
             return
         for row in unknown:
             ref = next((r for r in refs if r.serving_id == row["id"]), None)
-            if ref is None:
+            if ref is None and row["id"] in waiting:
+                # Its weights are named once llama-swap runs it (the user
+                # switched models, or its ttl unloaded it): not given up on.
+                registry.support(
+                    self.installation_store, row["id"], "pending", "waiting until llama-swap runs it"
+                )
+            elif ref is None:
                 registry.support(
                     self.installation_store,
                     row["id"],
@@ -2416,11 +2484,11 @@ class ModelScheduler(Scheduler):
         """A model already loaded on the server; reviewing never loads one."""
         from .models import registry
 
-        listing = getattr(self.upstream, "listing", None)
-        if listing is None:
+        items = await self.loaded_listing()
+        if items is None:
             return self.installation_config.base_identifier or None
         ids = {r["id"] for r in registry.entries(self.installation_store)}
-        for item in await listing():
+        for item in items:
             identifier = item.get("identifier")
             if item.get("type", "llm") == "llm" and (
                 identifier in ids or str(identifier).startswith("songe/")
@@ -2490,14 +2558,32 @@ class ModelScheduler(Scheduler):
     async def loaded_identifiers(self):
         """Identifiers of the models loaded on the server right now; None when
         the server cannot list them (then the configured one is assumed)."""
-        listing = getattr(self.upstream, "listing", None)
-        if listing is None:
+        items = await self.loaded_listing()
+        if items is None:
             return None
-        return {
-            item.get("identifier")
-            for item in await listing()
-            if item.get("type", "llm") == "llm"
-        }
+        return {item.get("identifier") for item in items if item.get("type", "llm") == "llm"}
+
+    async def loaded_listing(self):
+        """The server's loaded models as {"identifier", "type"}, or None when
+        it cannot say."""
+        listing = getattr(self.upstream, "listing", None)
+        if listing is not None:
+            return await listing()
+        # llama-swap behind the generic client (init found no weights to read)
+        # still loads whatever is asked for: its /running says what is loaded.
+        from .models import discovery
+
+        config = self.installation_config
+        loaded = await asyncio.to_thread(
+            discovery.llamaswap_loaded,
+            getattr(config, "server_source_url", "") or config.upstream_url,
+            getattr(self.upstream, "transport", None),
+        )
+        if loaded is None and not self.answered_running:
+            return None
+        # Once it has answered, a failed /running means nothing is loaded.
+        self.answered_running = True
+        return [{"identifier": i, "type": "llm"} for i in loaded or []]
 
     async def read_sessions(
         self, *, force=False, only=None, practice=False, seconds=None, quick=False

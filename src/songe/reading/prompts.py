@@ -8,6 +8,8 @@ they were checked against a hand-labelled answer key):
 - lesson: what to do differently, how general that is, how success is checked
 """
 
+import re
+
 TYPES = ["correction", "retry", "approval"]
 
 CLASSIFY_SCHEMA = {
@@ -75,6 +77,22 @@ BOTH_TRUE_SCHEMA = {
     "type": "object",
     "properties": {"kind": {"type": "string", "enum": ["both", "later_only"]}},
     "required": ["kind"],
+}
+
+SAME_SCHEMA = {
+    "type": "object",
+    "properties": {"same": {"type": "array", "items": {"type": "integer"}}},
+    "required": ["same"],
+}
+
+SAME_WISH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "note_1_asks": {"type": "string"},
+        "note_2_asks": {"type": "string"},
+        "kind": {"type": "string", "enum": ["same", "different"]},
+    },
+    "required": ["note_1_asks", "note_2_asks", "kind"],
 }
 
 LESSON_SCHEMA = {
@@ -275,10 +293,44 @@ Answer with JSON only."""
 TURN_EXAMPLE_NAMES = ("chinese", "polars", "pandas", "jquery", "linux")
 
 
-def turn_verdict(answer, message=""):
+# A lead-in that only points back at the conversation: a note is read without it.
+BACK = re.compile(r"^(same thing|same|again)\b[\s,]*((but|and)\s+)?", re.I)
+
+
+def own_words(message):
+    """The user's message as a note in their own words, or "" when it cannot
+    be one: a single word, several sentences (which of them is the wish is
+    not known), or longer than a note is left whole (quick.SHORT). Words
+    that only point back at the conversation are left off: "Same thing
+    without the comments." is noted as "Without the comments." (live: asked
+    whether that note and "uv please." are one wish, the model read "same
+    thing" as uv and put both in one place of the prompt)."""
+    from .rules import SENTENCES
+
+    own = " ".join(str(message).split())
+    if len(own) > 90 or len(SENTENCES.split(own)) != 1:
+        return ""
+    rest = BACK.sub("", own)
+    own = own if rest == own else rest[:1].upper() + rest[1:]
+    return own if len(own.split()) > 1 else ""
+
+
+def turn_verdict(answer, message="", earlier=""):
     """("lasting", the wish as a note) or ("once" | "task" | "reaction", "")
     from the answer to TURN about this message; (None, "") when the model
-    gave none."""
+    gave none. `earlier` is what the user wrote before it in the conversation.
+
+    The wish is the model's wording of what the user said, so it has to name
+    something this message names (rules.voiced), or the user has to have said
+    all of it earlier in the conversation ("Again, properly."). Live
+    (Qwen3.5-4B): 'Always start your reply with "Yes, chef."' came back as
+    the wish "Speak French.", was kept as the lesson and practised by a Deep
+    Dream; a remark about quotation marks came back as the question's own
+    example "Make the buttons green.", and a page pasted earlier had a
+    button in it. Such a wish is not used: the note is then the user's own
+    message, when that is one short sentence (own_words)."""
+    from .rules import voiced
+
     if not isinstance(answer, dict):
         return None, ""
     kind = answer.get("kind") if answer.get("kind") in ("once", "task", "reaction") else None
@@ -287,7 +339,11 @@ def turn_verdict(answer, message=""):
     wish, said = " ".join(str(answer.get("wish") or "").split()), message.lower()
     if said.isascii() and any(name in wish.lower() and name not in said for name in TURN_EXAMPLE_NAMES):
         return kind, ""
-    return "lasting", wish if 12 <= len(wish) <= 140 else ""
+    if not 12 <= len(wish) <= 140:
+        return "lasting", ""
+    if not voiced(wish, message) and voiced(wish, f"{earlier}\n{message}") < 1:
+        return "lasting", own_words(message)
+    return "lasting", wish
 
 
 # Asked about a sentence the rules flagged as a possible preference of the
@@ -346,6 +402,38 @@ Later: {new}
 Can both be true of the user now?
 - "both": yes. They are about different things, or the later one adds to the earlier one.
 - "later_only": no. The later sentence means the earlier one is no longer true: they changed their mind, stopped doing it, gave it up, or now want the opposite.
+Answer with JSON only."""
+
+# One wish, one place (reading/store.fold_same). A user asks for the same thing
+# in three conversations in three ways, and reading writes a note each time.
+# Two questions, as for REPLACES and for the same reason: which of the notes
+# kept so far a new note could repeat, then each one named with it alone.
+# The second question has the model say each note again as an instruction
+# before it answers. Live (Qwen3.5-4B, thinking off, pairs asked both ways):
+# asked "same" or "different" at once, it called 13 of 44 pairs about
+# different things the same ("Use pnpm, not npm." and "Write text without
+# using dashes."); saying them again first, 3 of 56, with 55 of 58 pairs that
+# are one wish found.
+SAME = """An AI assistant keeps short notes about one user: what the user wants in the assistant's replies.
+
+Notes kept so far:
+{notes}
+
+A new note:
+{note}
+
+Which of the notes kept so far could be the same wish of the user as the new note, said in other words? They would be about the same thing (the same tool, the same units, the same format, the same phrase, the same thing to leave out). One may say it more widely, or name one case of it.
+Most new notes are about something else: then name none.
+Answer with JSON only: {{"same": [the numbers of those notes]}}, with an empty list when there is none."""
+
+SAME_WISH = """An AI assistant keeps short notes about one user: what the user wants in the assistant's replies.
+
+Note 1: {a}
+Note 2: {b}
+
+Is this one wish of the user, noted twice? First say each note again in your own words, as an instruction of a few words that names exactly what to use, do or leave out. Then:
+- "same": the two instructions ask for the same. One may ask for it everywhere and the other in one situation, or one may name one kind of what the other names (one case of it, a part of it).
+- "different": they ask for two things (two tools, two foods, two things to leave out, two formats), or for opposite things.
 Answer with JSON only."""
 
 # The prompt's own example lessons: a lesson that repeats one of them was
