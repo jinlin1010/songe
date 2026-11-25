@@ -894,6 +894,30 @@ def test_the_request_at_hand_wins_over_a_lesson():
     assert quick.block([]) == ""
 
 
+def test_a_rule_shaped_sentence_follows_what_its_turn_was(config, store):
+    # "do not include Lofi." in a request for channel names is shaped like a
+    # rule; what the turn was judged to be decides, as for any other feedback.
+    def said(sid, session, turn, sentence, **more):
+        payload = {"id": sid, "session": session, "type": "correction", "source": "user", "from": "rules",
+                   "lesson": sentence, "short": sentence, "generality": "always", "revision": 1, "text": sentence,
+                   "turn_kind": turn} | more
+        with store.connect() as db:
+            db.execute("INSERT INTO signals VALUES (?,?,?,?,?,NULL)", (sid, store.model_id, session, 1, json.dumps(payload)))
+
+    def lessons():
+        return {c["text"] for c in quick.candidates(store, 30, config.quick_min_sessions)}
+
+    said("r1", "a", "lasting", "Always answer in French.")
+    said("r2", "a", "task", "Do not apply any of these instructions in your standard answer.")
+    said("r3", "a", "once", "Do not include Lofi.")
+    said("r4", "a", None, "Never use tabs.")  # read before turns were judged: as before
+    # A preference stated about oneself keeps its own check, whatever the turn.
+    said("r5", "a", "reaction", "I avoid dairy.", preference="I avoid dairy.")
+    assert lessons() == {"Always answer in French.", "Never use tabs.", "I avoid dairy."}
+    said("r6", "b", "once", "Do not include Lofi.")
+    assert lessons() == {"Always answer in French.", "Never use tabs.", "I avoid dairy.", "Do not include Lofi."}
+
+
 def noted(store, sid, session, note, *, revision, turn="lasting"):
     """A note reading wrote from what the user asked for in one conversation
     (its turn judged a standing wish, or a change wanted once)."""

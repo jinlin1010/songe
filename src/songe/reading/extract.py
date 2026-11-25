@@ -107,6 +107,7 @@ class Session:
             next((i for i, it in enumerate(items) if it["kind"] == "user"), 0)
         ]
         self.signals = []
+        self.turn_kinds = {}  # user item -> what the turn question made of it
         self.user_events = []
 
     def short(self, text):
@@ -401,6 +402,7 @@ class Session:
                             p.get("text") or e["text"],
                             f"as the user's message after step {e['after_step']}",
                         )
+                self.turn_kinds[e["item"]] = verdict
                 for signal in self.signals[before:]:
                     signal["turn_kind"] = verdict  # quick.suitable reads it
                     if wish:
@@ -598,6 +600,9 @@ async def read_session(session, items, rows, model):
                 "generality": "always",
                 "evidence_steps": [about["step"]] if about and about.get("step") else [],
                 "placed": True,
+                # What the turn it stands in was judged to be decides for it
+                # too (quick.suitable).
+                "turn_kind": reading.turn_kinds.get(item),
             }
         )
     # A preference the user states about themself ("I avoid dairy.") is kept in

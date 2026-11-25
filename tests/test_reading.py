@@ -238,6 +238,15 @@ def test_an_example_of_the_question_pasted_back_is_not_the_users_wish():
     assert P.turn_verdict({"standing": "yes", "kind": "once", "wish": "Use metric units."}, "everything in metric")[0] == "lasting"
 
 
+def test_a_rule_sentence_carries_what_its_turn_was(store):
+    # The rules find "Always ..." in the user's message by its shape; the
+    # verdict on the turn it stands in goes with it (quick.suitable).
+    record_session(store, reply_text="Always keep the old entry point working.")
+    read(store, Judging("no", "task"))
+    rule = next(s for s in reading.signals(store) if s.get("from") == "rules" and s["source"] == "user")
+    assert (rule["text"], rule["turn_kind"]) == ("Always keep the old entry point working.", "task")
+
+
 def test_a_wish_that_says_nothing_the_user_wrote_is_not_used():
     """Live (Qwen3.5-4B): the turn question returned the wish "Speak French."
     for a user who wrote 'Always start your reply with "Yes, chef."'."""
@@ -549,7 +558,7 @@ def test_the_client_stops_when_the_user_returns(store):
 ANSWERS = {
     "classify": {"parts": [{"says_something_is_wrong": True, "kind": "feedback",
                             "type": "correction", "text": "No, you changed the wrong file."}]},
-    "turn": {"standing": "no", "kind": "once"},
+    "turn": {"standing": "yes", "kind": "once", "wish": ""},
     "responsible": {"steps": [2], "reason": "wrong file"},
     "lesson": {"lesson": "Check the file first.", "instance": "x.py", "generality": "kind",
                "verifiable": None},

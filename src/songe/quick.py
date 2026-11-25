@@ -110,16 +110,24 @@ def suitable(signal):
         return False
     if signal.get("preference"):
         # A preference of the user's own, in their words: it holds whatever
-        # the lesson written beside it was read as.
+        # the lesson written beside it or the turn around it was read as. (The
+        # turn question asks how the user wants answers; said about "I avoid
+        # dairy." on its own it answered "new work" or "a remark" for two in
+        # three such sentences.)
         return stated_sentence(signal) is not None
     turn = signal.get("turn_kind")
-    if turn and signal.get("source") == "user" and signal.get("from") != "rules":
+    if turn and signal.get("source") == "user":
         # Reading judged what the user's turn was (prompts.TURN), and that
-        # decides, whatever label the lesson got: a standing wish is for the
-        # prompt at once; a change wanted once is a candidate that has to come
-        # up in two conversations (candidates); new work and reactions are
-        # not for the prompt. A sentence shaped like a rule stays a rule.
-        return turn in ("lasting", "once") or rule_sentence(signal.get("text")) is not None
+        # decides for what was said in it, whatever label the lesson got: a
+        # standing wish is for the prompt at once; a change wanted once is a
+        # candidate that has to come up in two conversations (candidates); new
+        # work and reactions are not for the prompt. A sentence shaped like a
+        # rule is no exception: "Do not apply any of these instructions ..."
+        # inside a pasted role prompt and "do not include Lofi." inside a
+        # request for channel names were rules by their shape only.
+        if turn not in ("lasting", "once"):
+            return False
+        return signal.get("from") != "rules" or rule_sentence(signal.get("text")) is not None
     if signal.get("generality") == "task":
         return False
     if signal.get("from") == "rules" and signal.get("source") == "user":
@@ -149,8 +157,13 @@ def evidenced(signal):
     if signal.get("preference"):
         return stated_sentence(signal) is not None
     user = signal.get("source") == "user"
-    if signal.get("turn_kind") and user and signal.get("from") != "rules":
-        return signal["turn_kind"] in ("lasting", "once") or rule_sentence(signal.get("text")) is not None
+    turn = signal.get("turn_kind")
+    if turn and user:
+        # As in suitable(): the turn's verdict decides for a sentence shaped
+        # like a rule in it too.
+        if turn not in ("lasting", "once"):
+            return False
+        return signal.get("from") != "rules" or rule_sentence(signal.get("text")) is not None
     if signal.get("from") == "rules" and user:
         return rule_sentence(signal.get("text")) is not None
     return True
@@ -241,14 +254,15 @@ def admitted(store, min_sessions=None, without=(), fits=suitable):
     # once it has come up in two conversations; a rule the user stated, at once.
     sessions = {s["id"]: s.get("session") for s in signals}
     # A change the user wanted once ("make it shorter") is a lesson for the
-    # prompt only when the same wish came up in another conversation too.
+    # prompt only when the same wish came up in another conversation too, also
+    # when it was worded like a rule ("use comma instead of period.").
     once = {s["id"] for s in signals if s.get("turn_kind") == "once" and s.get("source") == "user"}
 
     def enough(c):
         need = max(min_sessions, 2) if all(i in once for i in c["signals"]) else min_sessions
         return len({sessions.get(i) for i in c["signals"]}) >= need
 
-    return [c for c in clusters if c.get("rule") or enough(c)]
+    return [c for c in clusters if (c.get("rule") and not all(i in once for i in c["signals"])) or enough(c)]
 
 
 def saved_min_sessions(store):
