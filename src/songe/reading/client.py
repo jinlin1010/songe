@@ -37,14 +37,34 @@ WINDOW = {}
 # vLLM, asked for more tokens than the model's window: "max_tokens=6000 cannot
 # be greater than max_model_len=4096".
 OVER_WINDOW = re.compile(r"max_model_len=(\d+)")
-# vLLM, given a prompt longer than the model's window: "This model's maximum
-# context length is 4096 tokens. However, your prompt contains at least 4097
-# input tokens".
-PROMPT_OVER_WINDOW = "maximum context length"
+# vLLM names the window and the prompt's tokens when the two do not fit:
+# 0.34.0, a prompt longer than the window: "This model's maximum context
+# length is 4096 tokens. However, your prompt contains at least 4097 input
+# tokens"; older releases also when the prompt fits but max_tokens does not:
+# "This model's maximum context length is 4096 tokens and your request has 100
+# input tokens (6000 > 4096 - 100)", "However, you requested 6100 tokens (100
+# in the messages, 6000 in the completion)", "However, you requested 5000
+# tokens in the messages".
+CONTEXT = re.compile(r"maximum context length is (\d+) tokens")
+PROMPT_TOKENS = re.compile(r"(\d+) input tokens|\((\d+) in the messages|requested (\d+) tokens in the messages")
+
+
+def room(refusal):
+    """(window, prompt tokens) a refusal names, else None."""
+    window, prompt = CONTEXT.search(refusal), PROMPT_TOKENS.search(refusal)
+    if not window or not prompt:
+        return None
+    return int(window[1]), int(next(g for g in prompt.groups() if g))
 
 
 def over_window(response):
-    return response.status_code == 400 and PROMPT_OVER_WINDOW in response.text
+    """The prompt alone is longer than the model's window. Only then: a
+    refusal for max_tokens that the prompt leaves no room for (older vLLM
+    words it the same way) is not a reason to give the moment up for good."""
+    if response.status_code != 400:
+        return False
+    named = room(response.text)
+    return bool(named) and named[1] >= named[0]
 
 
 class Stopped(Exception):
@@ -223,11 +243,17 @@ class Reader:
           Phi-3-mini-4k, window 4,096): the same end. Up to the window the
           server takes any number and gives what the prompt leaves.
         A model with a small window and no reasoning parser is refused for
-        both, one after the other: three requests at most."""
+        both, one after the other: three requests at most.
+        Older vLLM refuses max_tokens beyond what the prompt leaves ("your
+        request has 100 input tokens (6000 > 4096 - 100)"): that request is
+        asked again for what is left (for this prompt only)."""
         for _ in range(3):
             payload = self.fitted(payload)
             response = await self.client.post(self.url + "/chat/completions", json=payload)
-            if response.status_code != 400 or not self.learn(payload, response.text):
+            if response.status_code != 400:
+                break
+            payload = self.learn(payload, response.text)
+            if payload is None:
                 break
         return response
 
@@ -241,19 +267,22 @@ class Reader:
         return payload
 
     def learn(self, payload, refusal):
-        """Whether a refusal named something to leave out or to lower from
-        now on."""
+        """The request to ask again when a refusal named something to leave
+        out or to lower, else None."""
         if "thinking_token_budget" in payload and "thinking_token_budget" in refusal:
             self.budget = False
             NO_BUDGET.add((self.url, self.model))
             logger.info("reader_no_thinking_budget the model server refused thinking_token_budget; asking without it")
-            return True
+            return payload
         window = OVER_WINDOW.search(refusal)
         if window and 0 < int(window.group(1)) < payload.get("max_tokens", 0):
             WINDOW[(self.url, self.model)] = int(window.group(1))
             logger.info("reader_window the model's window is %s tokens; asking for no more", window.group(1))
-            return True
-        return False
+            return payload
+        named = room(refusal)
+        if named and 0 < named[0] - named[1] < payload.get("max_tokens", 0):
+            return payload | {"max_tokens": named[0] - named[1]}
+        return None
 
     async def post(self, body, prompt, schema, name):
         """One question: (answer, finish reason, generated tokens, reasoning

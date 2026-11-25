@@ -275,3 +275,45 @@ async def test_a_model_with_a_small_window_is_asked_for_no_more_than_it_has(stor
     assert (await small.ask("a nearly full window", {"type": "object"}, "review")).get("gave_up")
     assert await small.ask("a short session", {"type": "object"}, "review") == {"ok": True}
     await small.close()
+
+
+async def test_older_vllm_refusing_max_tokens_is_asked_for_what_the_prompt_leaves(store, monkeypatch):
+    # Older vLLM words a max_tokens refusal like a prompt over the window
+    # ("maximum context length"). Taken for one, every moment was given up and
+    # cached for good; it is asked again for the room the prompt leaves.
+    monkeypatch.setattr(reading_client, "WINDOW", {}, raising=False)
+    sent = []
+    wordings = {
+        "new": "'max_tokens' or 'max_completion_tokens' is too large: {n}. This model's maximum context "
+               "length is 4096 tokens and your request has 100 input tokens ({n} > 4096 - 100).",
+        "old": "This model's maximum context length is 4096 tokens. However, you requested {t} tokens "
+               "(100 in the messages, {n} in the completion). Please reduce the length of the messages "
+               "or completion.",
+    }
+
+    def server_for(wording):
+        def server(request):
+            body = json.loads(request.content)
+            sent.append(body["max_tokens"])
+            content = body["messages"][0]["content"]
+            if "long session" in content:
+                return httpx.Response(400, json={"error": {"message": (
+                    "This model's maximum context length is 4096 tokens. However, you requested 5000 "
+                    "tokens in the messages, Please reduce the length of the messages."), "code": 400}})
+            if body["max_tokens"] > 4096 - 100:
+                n = body["max_tokens"]
+                return httpx.Response(400, json={"error": {
+                    "message": wordings[wording].format(n=n, t=n + 100), "code": 400}})
+            return httpx.Response(200, json={"choices": [{"finish_reason": "stop",
+                                                          "message": {"content": json.dumps({"ok": True})}}]})
+        return server
+
+    for wording in wordings:
+        sent.clear()
+        reader = reading_client.Reader(store, f"http://{wording}/v1", "m", server="vllm",
+                                       client=httpx.AsyncClient(transport=httpx.MockTransport(server_for(wording))))
+        assert await reader.ask(f"a session ({wording})", {"type": "object"}, "review") == {"ok": True}
+        assert sent[-1] == 3996 and reader.structured
+        # A prompt longer than the window is still given up.
+        assert (await reader.ask(f"a long session ({wording})", {"type": "object"}, "review")).get("gave_up")
+        await reader.close()
