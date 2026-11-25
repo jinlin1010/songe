@@ -151,11 +151,15 @@ or by auto-dream:
   things, a change wanted for this answer only, new work, or a reaction. Only
   a standing wish becomes a note in the prompt at once, also when the split
   into parts read it as a new task. A change wanted once becomes a note when
-  the same wish comes up in a second conversation. New work and reactions do
-  not become notes. The verdict also holds for a sentence shaped like a
-  rule in that message: inside new work or a reaction it is not a note, and
-  inside a change wanted once it waits for the second conversation. A
-  preference stated about oneself keeps its own check. Messages that were
+  the same wish comes up in a second conversation; it is stored as a
+  correction for that, also when the split read it as a new task. After a plain
+  answer (no tool call), a turn the split read as saying something is wrong
+  or missing while the turn question read new work or a question (a
+  reminder: "Where's my ...?") waits the same way. Other new work and
+  reactions do not become notes. The verdict also holds for a sentence shaped
+  like a rule in that message: inside new work or a reaction it is not a
+  note, and inside a change wanted once it waits for the second conversation.
+  A preference stated about oneself keeps its own check. Messages that were
   not judged (the opening one, "continue") are handled as before.
   The wish and the lesson for such a message are the model's wording of what
   the user wrote, checked in code (`rules.voiced`): one that names nothing

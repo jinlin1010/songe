@@ -321,7 +321,10 @@ class Session:
                 # how this user wants things, a change wanted once, new work,
                 # or a reaction. A standing wish the split above did not read
                 # as feedback ("i want in russian", read as a new task) is a
-                # correction all the same.
+                # correction all the same, and so is a change wanted once
+                # ('Say "Yes, chef." first.', read as a new task): it waits
+                # for the same wish in a second conversation (quick.candidates),
+                # which it cannot do when nothing is stored for it.
                 verdict, wish = ("task", "") if len(e["text"]) > P.TURN_CHARS else P.turn_verdict(
                     await self.model.ask(
                         P.TURN.format(
@@ -335,7 +338,24 @@ class Session:
                     e["text"],
                     "\n".join(user_messages(items, e["item"])),
                 )
-                if verdict == "lasting" and not any(
+                if (
+                    verdict == "task"
+                    and any(
+                        p.get("kind") == "feedback" and p.get("type") == "correction" and p.get("says_something_is_wrong")
+                        for p in parts
+                    )
+                    and not any(it.get("tool_calls") for it in items[turn + 1 : e["item"]] if it["kind"] == "action")
+                ):
+                    # The two questions disagree about a turn that follows a
+                    # plain answer: the split read a part that says something
+                    # is wrong or missing, the turn question read new work or
+                    # a question ('Where's my "Yes, chef."?'). Such a turn
+                    # waits like a change wanted once: it is a note only when
+                    # the same wish comes up in a second conversation, and a
+                    # reminder is one of the ways it does. After work with
+                    # tools the turn question's "new work" stands.
+                    verdict = "once"
+                if verdict in ("lasting", "once") and not any(
                     p.get("kind") == "feedback" and p.get("type") in P.TYPES for p in parts
                 ):
                     parts = parts + [{"says_something_is_wrong": True, "kind": "feedback",

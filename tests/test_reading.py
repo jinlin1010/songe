@@ -157,11 +157,67 @@ def test_a_standing_wish_read_as_new_work_is_still_a_correction(store):
     assert wish["lesson"] == wish["short"] == "Answer in Russian." and wish["generality"] == "always"
 
 
-@pytest.mark.parametrize("kind", ["once", "task", "reaction"])
+@pytest.mark.parametrize("kind", ["task", "reaction"])
 def test_a_turn_that_is_no_standing_wish_adds_nothing(store, kind):
     record_session(store, reply_text="could you add a paragraph on costs?")
     read(store, Judging("no", kind))
     assert [s for s in reading.signals(store) if s["type"] == "correction"] == []
+
+
+def test_a_change_wanted_once_read_as_new_work_waits_for_a_second_conversation(store):
+    """Live (Qwen3.5-4B): the split called 'Say "Yes, chef." first.' new work,
+    the turn question a change wanted once, and nothing was stored. The same
+    wish in the next conversation then had nothing to meet, in any number of
+    conversations."""
+    from songe import quick
+
+    first, again = 'Say "Yes, chef." first.', 'Say "Yes, chef." first, please.'
+    record_chat(store, ("Give me one tip for staying focused.", "Turn off notifications."), (first, "Yes, chef. Turn off notifications."))
+    read(store, Judging("no", "once"))
+    waiting = [s for s in reading.signals(store) if s["type"] == "correction"]
+    # A correction, for the prompt only once the wish recurs.
+    assert [(s["text"], s["turn_kind"], bool(s["lesson"])) for s in waiting] == [(first, "once", True)]
+    assert quick.candidates(store, 30, 2) == []
+    record_chat(store, ("What is the capital of Australia?", "Canberra."), (again, "Yes, chef. Canberra."))
+    read(store, Judging("no", "once"))
+    assert [len(c["signals"]) for c in quick.candidates(store, 30, 2)] == [2]
+
+
+class Disagreeing(FakeReader):
+    """The split reads every turn as a correction (FakeReader); the turn
+    question reads new work."""
+
+    async def ask(self, prompt, schema, name):
+        answer = await super().ask(prompt, schema, name)
+        if name == "lesson" and "Yes, chef." in prompt:
+            # A lesson in the user's words, the same for both reminders.
+            return dict(answer, lesson='Start every reply with "Yes, chef."', short='Start every reply with "Yes, chef."')
+        return {"standing": "no", "kind": "task", "wish": ""} if name == "turn" else answer
+
+
+def test_a_reminder_read_as_a_question_waits_like_a_change_wanted_once(store):
+    """Live (Qwen3.5-4B): the split read 'Where's my "Yes, chef."?' as a part
+    that says something is missing, the turn question as a question (new
+    work). It was stored as new work, so it never met 'You forgot the "Yes,
+    chef."' from another conversation, and the habit never got a note."""
+    from songe import quick
+
+    record_chat(store, ("What is the capital of Australia?", "Canberra."), ('Where\'s my "Yes, chef."?', "Yes, chef. Canberra."))
+    read(store, Disagreeing())
+    reminder = next(s for s in reading.signals(store) if s["type"] == "correction")
+    assert reminder["turn_kind"] == "once" and quick.suitable(reminder)
+    assert quick.candidates(store, 30, 2) == []  # waits for a second conversation
+    record_chat(store, ("What's a good name for a cat?", "Whiskers."), ('You forgot the "Yes, chef."', "Yes, chef. Whiskers."))
+    read(store, Disagreeing())
+    assert [len(c["signals"]) for c in quick.candidates(store, 30, 2)] == [2]
+
+
+def test_after_work_with_tools_the_turn_question_decides_what_is_new_work(store):
+    # "The tests still fail" after edits and test runs: the split calls it a
+    # correction, the turn question new work. That stays new work.
+    record_session(store, reply_text="the tests still fail")
+    read(store, Disagreeing())
+    assert [s["turn_kind"] for s in reading.signals(store) if s["type"] == "correction"] == ["task"]
 
 
 def test_a_long_message_is_work_and_is_not_asked_about(store):
