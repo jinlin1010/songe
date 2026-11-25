@@ -11,12 +11,15 @@ preferences, tool facts) and every lesson from the user's own feedback
 (corrections, retries, approvals), whatever its label: the generality label
 is noisy (27 of 43 on the answer key) and preferences come from the user.
 Skill lessons from tool results wait for Deep Dream. Near-duplicates are one
-lesson; the most recurrent, then the most recent, come first; at most
-config.prompt_lessons. A lesson the user removed never returns.
+lesson, and so are notes reading found to be one wish said in other words
+(reading.fold_same; the lesson then keeps each wording); the most recurrent,
+then the most recent, come first; at most config.prompt_lessons. A lesson the
+user removed never returns.
 
 State per learner (store scoped to the model), key "prompt_lessons":
 {"version": n, "updated_at": t, "lessons": [Lesson], "removed": [text]}
-Lesson: {"id", "text", "signals": [signal ids], "added_at", "count"}
+Lesson: {"id", "text", "signals": [signal ids], "added_at", "count", "rule",
+"joined" (only when the text holds several wordings of one wish)}
 """
 
 import re
@@ -128,31 +131,112 @@ def suitable(signal):
     return signal.get("type") in USER and rule_sentence(signal.get("text")) is not None
 
 
-def candidates(store, limit, min_sessions=2):
-    """Clusters of near-identical lessons, best first."""
-    absorbed = set(store.get("absorbed_signals") or [])
-    signals = [s for s in reading.signals(store) if suitable(s) and s["id"] not in absorbed]
+def evidenced(signal):
+    """Whether a lesson has the evidence Songe needs before it learns it,
+    the same for a note and for training.
+
+    Where reading judged what the user's turn was, that decides, as in
+    suitable(): a standing wish and a rule in their own words count at once,
+    a change wanted once counts when it comes up in a second conversation
+    (admitted), new work and reactions do not. What the lesson was read as
+    applying to (its generality) is not evidence: it says whether the lesson
+    fits the prompt, and a lesson for one kind of task that the prompt never
+    shows is still practised, on scenes of its kind. A lesson from the work
+    itself (a tool's output, a failed step), or one read before turns were
+    judged, has no judged turn to weigh and counts as it is."""
+    if not (signal.get("lesson") or "").strip():
+        return False
+    if signal.get("preference"):
+        return stated_sentence(signal) is not None
+    user = signal.get("source") == "user"
+    if signal.get("turn_kind") and user and signal.get("from") != "rules":
+        return signal["turn_kind"] in ("lasting", "once") or rule_sentence(signal.get("text")) is not None
+    if signal.get("from") == "rules" and user:
+        return rule_sentence(signal.get("text")) is not None
+    return True
+
+
+def wording(signal):
+    """A signal's note for the prompt, and whether it is the user's own
+    sentence: a sentence they stated, else the short form reading wrote for
+    the prompt (signals read before it existed fall back to the lesson,
+    trimmed by tidy)."""
+    rule = stated_sentence(signal) if signal.get("type") in USER else None
+    return rule or short_of(signal) or signal["lesson"].strip(), bool(rule)
+
+
+def joined(signals):
+    """The note of signals reading found to be one wish said in several ways
+    (reading.fold_same): each wording once, the most recent first, the user's
+    own sentences as they are. No wording is chosen over another: asked which
+    of two notes says more, the served model could not tell (Qwen3.5-4B: 29
+    of 42 pairs right), so "Use metric units." does not replace "Use Celsius,
+    not Fahrenheit.", it stands beside it in one place. Returns (the text,
+    whether any wording is the user's own, how many wordings)."""
+    parts, own = [], False
+    for s in sorted(signals, key=lambda s: s.get("revision") or 0, reverse=True):
+        text, rule = wording(s)
+        text = " ".join(text.split()) if rule else tidy(text)
+        if not any(normal(text) == normal(part) or similar(text, part) for part in parts):
+            parts.append(text if text[-1:] in ".!?。！？" else text + ".")
+            own = own or rule
+    return " ".join(parts)[:LESSON_CHARS].rstrip(), own, len(parts)
+
+
+def admitted(store, min_sessions=None, without=(), fits=suitable):
+    """The lessons that have the evidence to be learned, as clusters of
+    near-identical ones ({"text", "signals", "newest", "rule"}).
+
+    One evidence bar for both ways of learning: training is harder to undo
+    than a note, so its bar is not lower. Quick Dream puts in the prompt the
+    ones that also fit it (fits=suitable, see candidates); Deep Dream
+    practises every one with the evidence (fits=evidenced,
+    practice.store.lesson_signals) and no other. A correction the user
+    wanted once waits until the same wish comes up in another conversation,
+    in practice as in the prompt. (Live, Qwen3.5-4B: practice took every
+    signal with a lesson. "Just the code.", judged a one-off, had been read
+    as "Always include the exact file pattern requested by the user.", got 24
+    scenes and was trained.)
+
+    min_sessions: quick_min_sessions (None: this model's saved setting).
+    without: signal ids left out before grouping (the absorbed ones, for the
+    prompt)."""
+    if min_sessions is None:
+        min_sessions = saved_min_sessions(store)
+    signals = [s for s in reading.signals(store) if fits(s) and s["id"] not in without]
     removed = state(store)["removed"]
+    # One wish, one place: notes reading found to repeat an earlier note
+    # ({signal: the first signal that noted the wish}) are one cluster with
+    # it, however differently they are worded.
+    same = store.get(reading.SAME) or {}
+    by_id = {s["id"]: s for s in signals}
     clusters = []
     # Newest first: a cluster is named by its most recent wording.
     for s in sorted(signals, key=lambda s: s.get("revision") or 0, reverse=True):
-        rule = stated_sentence(s) if s.get("type") in USER else None
-        # The short form reading wrote for the prompt, when it has one (signals
-        # read before it existed fall back to the lesson, trimmed by tidy).
-        text = rule or short_of(s) or s["lesson"].strip()
+        text, rule = wording(s)
         if any(similar(text, r) for r in removed):
             continue
-        if rule:
+        first = same.get(s["id"], s["id"])
+        home = next((c for c in clusters if c["first"] == first or first in c["signals"]), None)
+        if home:
+            pass
+        elif rule:
             # A rule the user stated groups only with the same sentence of
             # theirs, never with lessons that merely look alike.
-            home = next((c for c in clusters if c.get("rule") and normal(c["text"]) == normal(rule)), None)
+            home = next((c for c in clusters if c.get("rule") and normal(c["text"]) == normal(text)), None)
         else:
             home = next((c for c in clusters if not c.get("rule") and similar(text, c["text"])), None)
         if home:
             home["signals"].append(s["id"])
         else:
             clusters.append({"text": text, "signals": [s["id"]], "newest": s.get("revision") or 0,
-                             "rule": bool(rule)})
+                             "rule": rule, "first": first})
+    for c in clusters:
+        text, own, wordings = joined([by_id[i] for i in c["signals"]])
+        if wordings > 1 and any(i in same for i in c["signals"]):
+            c.update(text=text, rule=own, joined=True)
+    # A lesson the user removed does not return under another of its wordings.
+    clusters = [c for c in clusters if not (c.get("joined") and any(similar(c["text"], r) for r in removed))]
     # A tool fact or standing preference read as "always" enters the prompt
     # once it has come up in two conversations; a rule the user stated, at once.
     sessions = {s["id"]: s.get("session") for s in signals}
@@ -164,7 +248,29 @@ def candidates(store, limit, min_sessions=2):
         need = max(min_sessions, 2) if all(i in once for i in c["signals"]) else min_sessions
         return len({sessions.get(i) for i in c["signals"]}) >= need
 
-    clusters = [c for c in clusters if c.get("rule") or enough(c)]
+    return [c for c in clusters if c.get("rule") or enough(c)]
+
+
+def saved_min_sessions(store):
+    """quick_min_sessions as saved for this store's model (the default when
+    nothing is saved or it cannot be read)."""
+    from .config import Config
+
+    try:
+        config, _ = Config.load_with_keys(store.root)
+        if store.model_key:
+            from .models.registry import model_config
+
+            config = model_config(config, store, store.model_key)
+        return config.quick_min_sessions
+    except Exception:  # noqa: BLE001 - a broken file must not stop learning
+        return Config.quick_min_sessions
+
+
+def candidates(store, limit, min_sessions=2):
+    """Clusters of near-identical lessons for the prompt, best first: the
+    admitted ones (admitted) that no adopted Deep Dream has absorbed."""
+    clusters = admitted(store, min_sessions, set(store.get("absorbed_signals") or []))
     clusters.sort(key=lambda c: (-len(c["signals"]), -c["newest"]))
     return clusters[:limit]
 
@@ -316,7 +422,8 @@ def shorten(text):
         # A cut that leaves a fragment ("Check that the program entry point")
         # is worse than a long lesson: keep the whole first sentence.
         text = first.rstrip(" ,.:-")
-    return text + "."
+    # A user's own sentence can end as a question ("Can you drop the em dashes?").
+    return text if text.endswith(("?", "!")) else text + "."
 
 
 def tidy(text):
@@ -359,7 +466,7 @@ def split(store, clusters):
         # Published under looser rules, or a model echo: it leaves the prompt.
         if ECHO.search(lesson["text"]):
             return False
-        if lesson.get("rule"):
+        if lesson.get("rule") and not lesson.get("joined"):
             # The user's own sentence: a standing rule, or a preference of
             # theirs that one of its signals still holds.
             return rule_sentence(lesson["text"]) == lesson["text"] or any(
@@ -370,9 +477,15 @@ def split(store, clusters):
     published = [dict(lesson, signals=list(lesson["signals"])) for lesson in active(store) if still_belongs(lesson)]
     fresh = []
     for c in clusters:
-        home = next((lesson for lesson in published if set(lesson["signals"]) & set(c["signals"])
-                     or (normal(c["text"]) == normal(lesson["text"]) if c.get("rule")
-                         else not lesson.get("rule") and similar(c["text"], lesson["text"]))), None)
+        shares = [lesson for lesson in published if set(lesson["signals"]) & set(c["signals"])]
+        home = shares[0] if shares else next(
+            (lesson for lesson in published
+             if (normal(c["text"]) == normal(lesson["text"]) if c.get("rule")
+                 else not lesson.get("rule") and similar(c["text"], lesson["text"]))), None)
+        for other in shares[1:]:
+            # Published apart, and found to be one wish since: one lesson.
+            published.remove(other)
+            home["signals"] += other["signals"]
         if home:
             home["signals"] = list(dict.fromkeys(home["signals"] + c["signals"]))
         else:
@@ -390,9 +503,16 @@ def quick_dream(store, config, now=None, merged=None, kept=None):
     if merged is None and kept is None:
         kept, merged = split(store, candidates(store, config.prompt_lessons * CANDIDATES, config.quick_min_sessions))
     by_id = {s["id"]: s for s in reading.signals(store)}
+    same = store.get(reading.SAME) or {}
     pool = []
     for lesson in kept or []:
-        if lesson.get("rule"):
+        said = [by_id[sid] for sid in lesson["signals"] if sid in by_id]
+        if said and (lesson.get("joined") or any(s["id"] in same for s in said)):
+            # One wish noted in several ways: the place keeps each wording.
+            text, own, wordings = joined(said)
+            lesson = {k: v for k, v in lesson.items() if k != "joined"} | {"rule": own}
+            lesson |= {"joined": True} if wordings > 1 else {}
+        elif lesson.get("rule"):
             text = lesson["text"]
         else:
             # Its newest short form, once reading has written one (wording then
@@ -404,6 +524,10 @@ def quick_dream(store, config, now=None, merged=None, kept=None):
             text = tidy(short_of(shorts[0]) if shorts else lesson["text"])
         pool.append(lesson | {"text": text, "count": len(lesson["signals"])})
     for c in merged or []:
+        if c.get("joined"):
+            pool.append({"text": c["text"], "signals": c["signals"], "count": len(c["signals"]),
+                         "rule": bool(c.get("rule")), "joined": True})
+            continue
         rule = c["text"] if c.get("rule") else user_rule(by_id, c["signals"])
         text = rule or tidy(c["text"])
         pool.append({"text": text[:LESSON_CHARS].rstrip(), "signals": c["signals"],
@@ -443,6 +567,7 @@ def quick_dream(store, config, now=None, merged=None, kept=None):
                 "added_at": old["added_at"] if old else now,
                 "rule": bool(c.get("rule")),
             }
+            | ({"joined": True} if c.get("joined") else {})
         )
     added = sum(1 for lesson in lessons if lesson["added_at"] == now)
     before = {lesson["id"]: lesson["text"] for lesson in current["lessons"]}
