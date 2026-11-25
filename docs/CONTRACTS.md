@@ -75,7 +75,8 @@ or by auto-dream:
   within `quick_read_seconds` (the older backlog is left to Deep), then
   publishes the prompt lessons (`quick.py`): lessons read as applying to any
   task, and rules the user stated (a sentence of theirs that starts like a
-  rule, used verbatim and kept first); other feedback waits for Deep Dream.
+  rule, used verbatim and kept first); other lessons with the evidence a note
+  needs (see practice below) wait for Deep Dream.
   Reading writes each lesson twice: `lesson` (one or two sentences, the Deep
   Dream teacher's note) and `short` (one instruction of at most 15 words, the
   prompt's form); Quick Dream uses `short`, and trims `lesson` by text only for
