@@ -366,12 +366,28 @@ def record_buffer_ceiling(store, stderr):
     return True
 
 
+def count_teacher_try(saved):
+    """An asked teacher length (teacher_wanted) whose measuring failed or was
+    stopped by the memory guard: counted, so it is not asked without end.
+    An interruption (the agent came back, battery, heat) is not a failure
+    and is not counted."""
+    size = saved.get("in_progress") or {}
+    length = size.get("teacher_sequence")
+    if size.get("kind") != "teacher" or length not in saved.get("teacher_wanted", []):
+        return False
+    tries = saved.setdefault("teacher_tries", {})
+    tries[str(length)] = tries.get(str(length), 0) + 1
+    return True
+
+
 def record_capacity_stop(store, saved):
     """Only total capacity is permanent. A stop the probe caused while other
     apps held memory says what the size costs, not that it never fits: the
     size is held until that much memory is free again."""
     from .calibration_state import policy_key
 
+    if count_teacher_try(saved):
+        store.set("calibration", saved)
     size = saved.get("in_progress")
     state = saved.get("progress") or {}
     if not size or not state.get("target_sequence"):
@@ -831,8 +847,11 @@ def held(saved, kind):
 def next_teacher(saved, teacher_target):
     """Double the measured teacher length toward the longest real one; bisect
     below a total-capacity limit or a size held for lack of free memory."""
-    from .calibration_state import close_enough, teacher_measured
+    from .calibration_state import close_enough, teacher_measured, teacher_wanted
 
+    wanted = teacher_wanted(saved)
+    if wanted:
+        return wanted[0]
     measured = teacher_measured(saved)
     if measured >= teacher_target:
         return None
@@ -964,6 +983,9 @@ def main():
         # is its capacity, so the smaller measured sizes stand.
         if args.child and record_buffer_ceiling(scoped, str(exc).encode()):
             return
+        saved = scoped.get("calibration") or {}
+        if count_teacher_try(saved):
+            scoped.set("calibration", saved)
         scoped.set(
             "child_error",
             DEVICE_FULL if device_full(exc) else failure_hint("Calibration", args.data_dir),

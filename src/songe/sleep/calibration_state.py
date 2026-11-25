@@ -263,6 +263,99 @@ def teacher_measured(saved):
     )
 
 
+TEACHER_TRIES = 2
+
+
+def pending_teachers(config, saved, store=None):
+    """The teacher length each pending example needs."""
+    pending = pending_keys(store, config) if store else None
+    return [
+        s.get("teacher_sequence") or s["required_sequence"]
+        for s in saved.get("samples", [])
+        if pending is None or (s["id"], s["revision"]) in pending
+    ]
+
+
+def teacher_to_ask(config, saved, store, sizing):
+    """The calibration with the teacher length to measure for examples that
+    today's slice defers (sizing admits shorter teachers only), or None when
+    measuring would not help: then they wait, and the reason says so.
+
+    It asks for the longest deferred length below the shortest measured one
+    that does not fit, so one measurement admits all of them (#140). If an
+    earlier ask was measured and still did not fit, it asks for the middle
+    of what is left, so the lengths are bisected, not tried one by one."""
+    admitted = sizing.get("max_teacher_sequence", float("inf"))
+    deferred = sorted(t for t in pending_teachers(config, saved, store) if t > admitted)
+    if not deferred:
+        return None
+    tries = saved.get("teacher_tries", {})
+    measured = [
+        r.get("teacher_sequence", 0)
+        for r in saved.get("teacher_rows", [])
+        + saved.get("teacher_limits", [])
+        + [h for h in saved.get("held", []) if h.get("kind") == "teacher"]
+    ] + [
+        # Asked and failed every try: it does not fit either; look below it.
+        w
+        for w in saved.get("teacher_wanted", [])
+        if tries.get(str(w), 0) >= TEACHER_TRIES
+    ]
+    ceiling = min((t for t in measured if t >= deferred[0]), default=None)
+    # Within a tenth of a length that does not fit, it would not fit either.
+    gap = [
+        t
+        for t in deferred
+        if ceiling is None or (t < ceiling and not close_enough(t, ceiling))
+    ]
+    if not gap:
+        return None
+    asked_before = ceiling is not None and ceiling in saved.get("teacher_wanted", [])
+    length = gap[(len(gap) - 1) // 2] if asked_before else gap[-1]
+    return ask_for_teacher(saved, length)
+
+
+def teacher_wanted(saved):
+    """Teacher lengths deferred examples need that no measurement covers yet.
+
+    Measuring doubles the teacher length toward the longest example, so it
+    can jump over the length most examples need. When the measured length
+    above it does not fit beside the user's server, every example is
+    deferred and nothing measures again (#140); the scheduler then asks for
+    that exact length here."""
+    done = [
+        r.get("teacher_sequence", 0)
+        for r in saved.get("teacher_rows", [])
+        + saved.get("teacher_limits", [])
+        + [h for h in saved.get("held", []) if h.get("kind") == "teacher"]
+    ]
+    limits = [r.get("teacher_sequence", 0) for r in saved.get("teacher_limits", [])]
+    tries = saved.get("teacher_tries", {})
+    return sorted(
+        w
+        for w in set(saved.get("teacher_wanted", []))
+        if not any(w <= t and close_enough(w, t) for t in done)
+        # Beyond the whole machine: never measured again.
+        and not any(t <= w for t in limits)
+        # A measurement that failed twice (the card was full, say) is not
+        # asked again; otherwise the model would measure instead of train.
+        and tries.get(str(w), 0) < TEACHER_TRIES
+    )
+
+
+def ask_for_teacher(saved, length):
+    """The calibration with a teacher of `length` tokens asked for (measuring
+    is then incomplete), or None when a measurement already covers it."""
+    asked = saved | {
+        "teacher_wanted": sorted(set(saved.get("teacher_wanted", [])) | {length})
+    }
+    if not teacher_wanted(asked):
+        return None
+    if asked.get("progress"):
+        asked["progress"] = asked["progress"] | {"complete": False}
+    return asked
+
+
 def bracket(config, rows, limits):
     """The smallest-chunk failure and the largest success below it."""
     boundary = min(
@@ -323,9 +416,15 @@ def progress(config, saved, target, pool):
     teacher_stopped = bool(teacher_bounds) and close_enough(
         measured_teacher, min(teacher_bounds)
     )
-    teacher_done = measured_teacher >= teacher_target or teacher_stopped
+    teacher_done = (
+        measured_teacher >= teacher_target or teacher_stopped
+    ) and not teacher_wanted(saved)
     sequence_done = coverage(config, rows, target) or sequence_held
-    complete = (sequence_done and teacher_done) or memory_bounded or chunk_bounded
+    # A teacher length asked for (teacher_wanted) is measured even when the
+    # window reached its memory limit; otherwise it would be asked forever.
+    complete = (sequence_done and teacher_done) or (
+        (memory_bounded or chunk_bounded) and not teacher_wanted(saved)
+    )
     if memory_bounded or chunk_bounded:
         reason = "memory"
     elif complete and saved.get("held"):

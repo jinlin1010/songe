@@ -760,6 +760,12 @@ most a one-line label on an example.
   record carries `judged` rows, `improved` {count, worse, same, checked} and
   the report's examples are the moments won. If the backend cannot answer,
   the KL decides and `judged_error` says so.
+  Each version also answers up to 8 moments the lessons are not about (the
+  drift set's confirmed successes, one per conversation). The record's
+  `unrelated_actions` is, per strength tried, {changed, checked}: at how many
+  of them the candidate takes another action than the version in use
+  (`quick.differs`). Recorded only: it decides nothing. Absent when there
+  are no confirmed successes yet.
 
 **Dream control**
 
@@ -797,8 +803,13 @@ Training follows DESIGN 3 (OPSD). The student is base + LoRA on the exact logged
 context c; the teacher is the version the cycle started from (the original base in
 the first cycle), frozen, on the same c plus a marked hindsight block: the logged
 observations, then the idle review's "What went wrong" and "Lesson" when the reply
-was reviewed, then "Respond now with your own action." General anchors carry no
-hindsight and keep the original base as teacher. Forward KL over the full
+was reviewed, then "Respond now with your own action." A practice scene's
+hindsight is one note Songe wrote (the lesson and the feedback it came from), so
+its teacher gets that note as an aside instead: not part of the conversation,
+shown only to it, to follow where it applies and not to mention. The aside asks
+for "the reply to the message above" when the scene has no tools and, when it
+has, for "your own action" as a real step's block does. General anchors
+carry no hindsight and keep the original base as teacher. Forward KL over the full
 vocabulary, each vocabulary entry's contribution clipped at `vocab_clip`
 (provisional 1.0 until measured), is evaluated on the student's freshly sampled
 action tokens only. Prompt, user, tool and historical assistant tokens never
@@ -839,6 +850,17 @@ on the logged system prompt and tool schemas), and the teacher's hindsight is
 that scene's teacher note ("Note from an earlier, different task (it may not
 apply here)", the feedback and the lesson). Real contexts are never trained on;
 replay draws from earlier practice scenes. Anchors and the gate are unchanged.
+
+A scene counts as practised once a Deep Dream that trained it is adopted
+(`practice_revisions`). A Dream that is not adopted, rejected by the gate or
+never loaded by the model server, practised nothing: its scenes are kept under
+`rejected_practice` and trained again, in full, by the next Dream that has a
+new scene, after the scenes no Dream has tried when the Dream is capped. On
+their own they wait, since the same scenes alone would be rejected again. A
+scene trained by three Dreams that were not adopted counts as practised from
+then on and comes back as replay only. Forgetting, a change of a model's
+learning level and a switch of learning mode clear `rejected_practice` together
+with `practice_revisions`.
 
 References: [Thinking Machines, On-Policy Distillation (2025)](https://thinkingmachines.ai/blog/on-policy-distillation/);
 [OPSD (2601.18734)](https://arxiv.org/abs/2601.18734);

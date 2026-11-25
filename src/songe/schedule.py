@@ -650,10 +650,19 @@ class Scheduler:
                 or size.get("max_teacher_sequence", float("inf")) >= shortest
             )
 
-        if not retrying and fits(
-            choose_size(config, calibration, after_unload(before, reclaimable), history)
-        ):
+        size = choose_size(config, calibration, after_unload(before, reclaimable), history)
+        if not retrying and fits(size):
             return None
+        if size and not fits(size):
+            # Training would fit, but no teacher length the examples need
+            # was measured: measure it rather than wait for memory (#140).
+            from .sleep.calibration_state import teacher_to_ask
+
+            asked = teacher_to_ask(config, calibration, store, size)
+            if asked is not None:
+                store.set("calibration", asked)
+                self.last_fit = None
+                return "Measuring memory for longer conversations"
         needed = free_needed(config, calibration, before, history, fits)
         self.last_fit = (before, needed)  # for note_fit_wait
         return waiting_reason(before, history, needed)
@@ -1056,7 +1065,8 @@ class Scheduler:
                         self.reason = wait
                         # The wait a pressed Deep Dream is in before training
                         # (live: the page showed nothing for it).
-                        self.note_fit_wait(*self.last_fit)
+                        if self.last_fit:
+                            self.note_fit_wait(*self.last_fit)
                         return
                 if unloads:
                     wait = park_wait(
@@ -1082,7 +1092,12 @@ class Scheduler:
 
                 training_platform = TrainingPlatform(self.platform, self.config)
                 sample = await asyncio.to_thread(snapshot, training_platform)
-                from .sleep.sizing import choose_size, free_needed, waiting_reason
+                from .sleep.sizing import (
+                    choose_size,
+                    free_needed,
+                    gigabytes,
+                    waiting_reason,
+                )
 
                 self.observe_memory(sample)
                 sizing = (
@@ -1110,18 +1125,46 @@ class Scheduler:
                         shortest is not None
                         and sizing.get("max_teacher_sequence", float("inf")) < shortest
                     ):
+                        from .sleep.calibration_state import teacher_to_ask
+                        from .sleep.sizing import teacher_card_shortfall
+
+                        asked = teacher_to_ask(
+                            self.config,
+                            self.store.get("calibration") or {},
+                            self.store,
+                            sizing,
+                        )
+                        if asked is not None:
+                            # No teacher of the length these examples need was
+                            # measured (the ladder jumped over it): measure it
+                            # instead of deferring them on every slice (#140).
+                            self.store.set("calibration", asked)
+                            self.reason = "Measuring memory for longer conversations"
+                            await self.restore()
+                            return
+                        needed = free_needed(
+                            self.config,
+                            calibration,
+                            sample,
+                            self.pressure_history.data,
+                            lambda s: s.get("max_teacher_sequence", 0) >= shortest,
+                        )
+                        card = teacher_card_shortfall(calibration, sample, shortest)
                         self.reason = waiting_reason(
                             sample,
                             self.pressure_history.data,
-                            free_needed(
-                                self.config,
-                                calibration,
-                                sample,
-                                self.pressure_history.data,
-                                lambda s: s.get("max_teacher_sequence", 0) >= shortest,
+                            needed,
+                            what="intact training samples deferred"
+                            + (
+                                f" · the graphics card needs {gigabytes(card)} more free"
+                                if card
+                                else ""
                             ),
-                            what="intact training samples deferred",
                         )
+                        # Measured and still too big beside what else runs: a
+                        # pressed Dream ends with a note instead of retrying
+                        # without end.
+                        self.note_fit_wait(sample, needed)
                         self.unload_retry_at = time.monotonic() + RETRY_FIRST_SECONDS
                         await self.restore()
                         return
@@ -1375,7 +1418,15 @@ class Scheduler:
                             "Update could not be loaded by the model server"
                         )
                         self.store.night(night["id"], status="rejected", record=record)
-                        self.store.set("experience_watermark", record["watermark"])
+                        if self.store.get("learning_mode", "hindsight") == "dreams":
+                            # Not adopted, so not practised: under Dreams the
+                            # watermark counts practice scenes, and moving it
+                            # hid this Dream's scenes from every later one.
+                            from .practice.pool import keep_for_retry
+
+                            keep_for_retry(self.store, record.get("practice_revisions") or {})
+                        else:
+                            self.store.set("experience_watermark", record["watermark"])
                     else:
                         self.store.night(night["id"], record=record)
                     self.state = "awake"

@@ -840,7 +840,7 @@ class Store:
                 "INSERT OR REPLACE INTO state VALUES ('rebuild_required','true')"
             )
             db.execute(
-                "DELETE FROM state WHERE key IN ('experience_watermark','score_watermark','teacher_gain','unfit_samples','practice_revisions') OR key LIKE 'model:%:practice_revisions' OR key LIKE 'model:%:experience_watermark' OR key LIKE 'model:%:score_watermark' OR key LIKE 'model:%:teacher_gain' OR key LIKE 'model:%:unfit_samples'"
+                "DELETE FROM state WHERE key IN ('experience_watermark','score_watermark','teacher_gain','unfit_samples','practice_revisions','rejected_practice') OR key LIKE 'model:%:practice_revisions' OR key LIKE 'model:%:rejected_practice' OR key LIKE 'model:%:experience_watermark' OR key LIKE 'model:%:score_watermark' OR key LIKE 'model:%:teacher_gain' OR key LIKE 'model:%:unfit_samples'"
             )
             db.execute(
                 "DELETE FROM state WHERE key IN ('wake_last','dream_volume') OR key LIKE 'model:%:wake_last' OR key LIKE 'model:%:dream_volume'"

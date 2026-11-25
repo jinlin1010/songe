@@ -76,8 +76,8 @@ async def test_a_cut_off_answer_is_forced_from_the_reasoning_so_far(store):
 
 
 async def test_a_server_that_refuses_the_thinking_cap_is_asked_without_it(store):
-    """Live (vLLM 0.34.0 serving Mistral-7B-Instruct-v0.2 with the server's
-    defaults, so without --reasoning-parser): every reader
+    """Live (vLLM 0.34.0 serving Mistral-7B-Instruct-v0.2 and TinyLlama with
+    the server's defaults, so without --reasoning-parser): every reader
     question was answered 400 "thinking_token_budget is set but
     reasoning_config is not configured". The reader took the first refusal for
     "no structured output", asked plainly, was refused again, and no session
