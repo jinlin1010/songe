@@ -187,6 +187,9 @@ class Disagreeing(FakeReader):
 
     async def ask(self, prompt, schema, name):
         answer = await super().ask(prompt, schema, name)
+        if name == "lesson" and "Yes, chef." in prompt:
+            # A lesson in the user's words, the same for both reminders.
+            return dict(answer, lesson='Start every reply with "Yes, chef."', short='Start every reply with "Yes, chef."')
         return {"standing": "no", "kind": "task", "wish": ""} if name == "turn" else answer
 
 
