@@ -201,6 +201,22 @@ def practice_aside(note, tools=False):
     }
 
 
+def practice_messages(scene, note, *, merged=False):
+    """A practice scene as its teacher is asked it: the scene, then the note
+    as an aside. merged: for a chat template that takes no second user
+    message in a row, the aside goes at the end of the last user message
+    (as paired_prompts does when rendering fails)."""
+    aside = practice_aside(note)
+    if not merged:
+        return [*scene, aside]
+    messages = copy.deepcopy(scene)
+    last = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    if last is None or not isinstance(last.get("content"), str):
+        return [*scene, aside]
+    last["content"] = last["content"] + "\n\n" + aside["content"]
+    return messages
+
+
 def paired_prompts(
     tokenizer,
     step,

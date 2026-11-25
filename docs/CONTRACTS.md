@@ -612,7 +612,7 @@ status lines.
 // Practice: one line per scene, so surfaces can list them plainly.
 {
   "written": 137, "kept": 112, "dropped": 25,
-  "dropped_by": {"<check code>": 25},   // built | decision | parses | not_copy | matters
+  "dropped_by": {"<check code>": 25},   // built | decision | parses | not_copy | matters | changes
   "recent": [PracticeLine]        // newest 5; all in the full record
 }
 // PracticeLine
@@ -874,7 +874,15 @@ on-policy distillation, but the pool changes: the student's context is a
 practice scene (a generated conversation ending where a lesson matters, built
 on the logged system prompt and tool schemas), and the teacher's hindsight is
 that scene's teacher note ("Note from an earlier, different task (it may not
-apply here)", the feedback and the lesson). Real contexts are never trained on;
+apply here)", the feedback and the lesson). A lesson from a plain chat (a
+request without tools) gets a different scene: one new opening message of the
+same kind as the one the user sent before their feedback, written without
+sight of the lesson, under the logged system prompt if there was one. It is
+kept by the `changes` check instead of the forced choice between two lessons:
+the served model answers it with and without the note, and the base, asked in
+both orders, must find that the answer with the note does what the user's
+feedback asks. On a server whose reasoning leaves no room for those answers
+they are asked again with reasoning switched off, then with more room. Real contexts are never trained on;
 replay draws from earlier practice scenes. Anchors and the gate are unchanged.
 
 A scene counts as practised once a Deep Dream that trained it is adopted

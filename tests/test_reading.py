@@ -329,6 +329,34 @@ def test_the_client_falls_back_when_structured_output_is_refused(store):
     assert reader.cached == 1
 
 
+def test_the_client_asks_for_a_plain_reply_the_way_a_user_does(store):
+    """reply(): the served model's next message in a conversation, with no
+    schema and none of the reasoning switches the reader's questions set."""
+    sent = []
+
+    def server(request):
+        sent.append(json.loads(request.content))
+        message = {"role": "assistant", "content": "uv add numpy"}
+        if len(sent) == 2:
+            message["reasoning"] = "The user wants uv."
+        return httpx.Response(200, json={"choices": [{"message": message, "finish_reason": "stop"}]})
+
+    reader = Reader(store, "http://x/v1", "m", server="vllm",
+                    client=httpx.AsyncClient(transport=httpx.MockTransport(server)))
+    messages = [{"role": "user", "content": "How do I add numpy?"}]
+    first = asyncio.run(reader.reply(messages, max_tokens=384))
+    assert first == {"content": "uv add numpy", "finished": True, "reasoned": False}
+    assert sent[0] == {"model": "m", "messages": messages, "temperature": 0, "max_tokens": 384, "stream": False}
+    # A server that reasons first says so (either field name, or <think> text).
+    assert asyncio.run(reader.reply(messages, max_tokens=384))["reasoned"] is True
+    away = Reader(store, "http://x/v1", "m", still_idle=lambda: False, client=reader.client)
+    try:
+        asyncio.run(away.reply(messages, max_tokens=384))
+    except Stopped:
+        return
+    raise AssertionError("expected Stopped")
+
+
 def test_the_client_stops_when_the_user_returns(store):
     reader = Reader(store, "http://x/v1", "m", still_idle=lambda: False,
                     client=httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(500))))
@@ -663,7 +691,9 @@ async def test_a_failing_practice_scene_is_retried_then_skipped_and_only_repeate
     signals_ = [({"id": f"s{i}", "session": "x", "lesson": "L."}, [1]) for i in range(5)]
     monkeypatch.setattr(ps, "RETRY_WAITS", (0, 0))
     monkeypatch.setattr(ps, "wanted", lambda store, n: signals_)
-    monkeypatch.setattr(ps, "source", lambda store, s: ({"messages": [{"role": "user", "content": "hi"}]}, []))
+    # An agent's request (it has tools): each scene is written on its own.
+    request = {"messages": [{"role": "user", "content": "hi"}], "tools": TOOLS}
+    monkeypatch.setattr(ps, "source", lambda store, s: (request, []))
     saved = []
     monkeypatch.setattr(ps, "save", lambda store, row: saved.append(row["id"]))
     calls = {}
