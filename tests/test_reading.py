@@ -245,7 +245,20 @@ def test_a_lesson_that_guesses_what_was_wrong_with_an_answer_is_no_lesson(store)
 def test_a_guess_about_a_turn_that_asked_for_no_change_is_no_lesson(store, kind):
     record_chat(store, ("When was the first iPhone released?", "It was announced on January 9, 2007."),
                 ("And the first iPad?", "April 3, 2010."))
-    read(store, Guessing("Always use the public availability date, not the announcement date.", {"standing": "no", "kind": kind, "wish": ""}))
+    # The split finds feedback but nothing wrong in it, as for a follow-up
+    # question: the turn question's verdict stands (a part that says something
+    # is wrong after a plain answer would wait like a change wanted once).
+    reader = Guessing("Always use the public availability date, not the announcement date.", {"standing": "no", "kind": kind, "wish": ""})
+    ask = reader.ask
+
+    async def nothing_wrong(prompt, schema, name):
+        answer = await ask(prompt, schema, name)
+        if name == "classify":
+            answer = {"parts": [dict(p, says_something_is_wrong=False) for p in answer["parts"]]}
+        return answer
+
+    reader.ask = nothing_wrong
+    read(store, reader)
     guess = next(s for s in reading.signals(store) if s["type"] == "correction")
     assert (guess["lesson"], guess["short"], guess["unvoiced"]) == (None, None, True)
     from songe.practice.store import lesson_signals
