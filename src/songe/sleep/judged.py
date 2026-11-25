@@ -177,12 +177,23 @@ def does(backend, step, answer):
     request, guide = request_of(step) or "(not shown)", guide_of(step) or "(none)"
     with backend.base():
         text = ask(backend, DOES.format(request=request, guide=guide, answer=shown(answer)))
-    found = re.match(r'\s*\{\s*"follows"\s*:\s*"\s*(yes|no)', text or "", re.I)
-    if not found:
+    found = verdict(text)
+    if found is None:
         # Live: about 4 of 14 replies could not be read; what they say.
         logger.info("judge_unreadable %s: %r", step["id"], (text or "")[:200])
         return None
-    return found.group(1).lower() == "yes"
+    return found
+
+
+def verdict(text):
+    """True for yes, False for no, None when the reply says neither. The
+    begun reply ('{"follows": "yes"...'), else the JSON anywhere after a
+    preamble or a thought (a tokenizer without the prefill); "not sure" or
+    "nope" is not a no."""
+    text = text or ""
+    found = re.match(r'\s*\{\s*"follows"\s*:\s*"\s*(yes|no)(?![a-z])', text, re.I) or re.search(
+        r'"follows"\s*:\s*"\s*(yes|no)\s*"', visible(text), re.I)
+    return found.group(1).lower() == "yes" if found else None
 
 
 def outcome(backend, step, before, after):

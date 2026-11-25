@@ -1137,3 +1137,18 @@ def test_the_incumbents_measurements_are_kept_for_the_next_dream(tmp_path, confi
     evaluate(v, v, refs[:1], [], drift_refs=drift_refs,
              kept_as=KeptMeasurements(tmp_path, ["incumbent-b"]))
     assert len(calls) == 12 + 2 and len(list(tmp_path.iterdir())) == 1
+
+
+def test_the_judge_s_yes_or_no_is_read_after_a_preamble_and_not_from_a_longer_word():
+    """Where the tokenizer cannot take the begun reply the judge may write a
+    sentence or a thought before its JSON: still a verdict. "not sure" or
+    "nope" is neither a yes nor a no."""
+    from songe.sleep.judged import verdict
+
+    assert verdict('{"follows": "yes"}') is True
+    assert verdict('{"follows": "no"}') is False
+    assert verdict('Looking at it, the answer uses pnpm.\n{"follows": "yes"}') is True
+    assert verdict('<think>it still says npm</think>{"follows": "no"}') is False
+    assert verdict('{"follows": "not sure"}') is None
+    assert verdict('{"follows": "nope"}') is None
+    assert verdict("Let me think about the answer") is None

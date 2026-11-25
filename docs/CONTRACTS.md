@@ -747,11 +747,12 @@ most a one-line label on an example.
   lessons (never trained on, one scene each, fixed order) fill the places up
   to `min_heldout` (5). Each unit's last 3 moments, 24 at most. At each moment
   the version in use and the candidate answer deterministically (384 tokens);
-  the same action is a tie; a different one goes to the original base model
-  (blind A/B: request, the user's feedback or the lesson, both answers):
-  win, loss or tie. "Both", "neither", a pick that changes with the order
-  or a reply that cannot be read is a tie; the teacher's preference, which
-  training fits, never breaks it.
+  the same action is a tie; of two different ones each goes on its own to
+  the original base model (request, the user's feedback or the lesson, one
+  answer: does it do what the feedback asks, yes or no; never which of two
+  it prefers). A win when only the candidate's does, a loss when only the
+  answer in use does; both, neither or a reply that cannot be read is a tie;
+  the teacher's preference, which training fits, never breaks it.
   Each moment is one unit (win +1, loss −1, tie 0), resampled per moment
   (user decision: per conversation, 5 units left the lower bound at 0); at
   least `min_heldout` conversations must be present. Adopt only if wins >
