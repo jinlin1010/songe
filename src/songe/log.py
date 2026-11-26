@@ -200,6 +200,7 @@ SHARED_STATE = {
     "forgotten_at",
     "interface_settings",
     "memory_pressure_history",
+    "cloud",
 }
 
 
@@ -654,12 +655,12 @@ class Store:
                         None,
                     )
                     if same:
-                        # Same state with new numbers: update it in place.
-                        db.execute(
-                            "UPDATE events SET created=?, text=? WHERE id=?",
-                            (time.time(), text, same),
-                        )
-                        return
+                        # Same state with new numbers: it moves to the newest
+                        # line. A new row, not a new time: Windows' clock
+                        # (Python 3.12 and older) ticks every ~15.6 ms, so
+                        # lines within one tick share a time and only the id
+                        # orders them.
+                        db.execute("DELETE FROM events WHERE id=?", (same,))
                 row = db.execute(
                     "INSERT INTO events(created,model_id,stage,text) VALUES (?,?,?,?)",
                     (time.time(), model_id, stage, text),
@@ -839,6 +840,11 @@ class Store:
                     )
             db.execute("DELETE FROM events")
             db.execute("DROP TABLE IF EXISTS observations")
+            # What cloud calls sent quotes the conversations; their costs stay
+            # so tonight's budget still holds.
+            from .cloud.ledger import forget_previews
+
+            forget_previews(db)
             for row in db.execute("SELECT id FROM models").fetchall():
                 db.execute(
                     "INSERT OR REPLACE INTO state VALUES (?, 'true')",

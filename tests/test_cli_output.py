@@ -69,6 +69,9 @@ def state():
 
 def assert_snapshot(name, output):
     assert "\x1b" not in output and "\r" not in output
+    # Rich pads a table's last column to its widest cell; none of it is
+    # printed (every `songe init` line ended in spaces).
+    assert [line for line in output.splitlines() if line != line.rstrip()] == []
     plain = "\n".join(line.rstrip() for line in output.splitlines()) + "\n"
     if os.environ.get("SONGE_UPDATE_SNAPSHOTS"):
         (SNAPSHOTS / f"cli_{name}.txt").write_text(plain, encoding="utf-8")
@@ -445,3 +448,19 @@ def test_non_utf8_stdio_streams_do_not_crash(tmp_path, monkeypatch):
     cli.sys.stderr.flush()
     assert "✓ Learning paused" in out_buf.getvalue().decode("utf-8")
     assert "✗ Songe is stopped" in err_buf.getvalue().decode("utf-8")
+
+
+def test_a_model_that_cannot_learn_is_named_once():
+    """Now and Next both said "Choose another model"."""
+    from songe.wording import status_lines
+
+    data = {
+        "activity": {
+            "now": "waiting · unsupported · Gemma 3",
+            "next": "choose another model",
+        }
+    }
+    assert status_lines(data) == [
+        ("now", "Not supported yet · Gemma 3"),
+        ("next", "Choose another model"),
+    ]

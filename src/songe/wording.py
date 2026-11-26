@@ -49,7 +49,7 @@ def readable(value):
         (r"checks pass \+", "after checks pass and"),
         (r"needs more data", "after more conversations"),
         (r"needs data", "after your first conversations"),
-        (r"\bresume → ", "turn learning on → "),
+        (r"\bresume → ", "run songe resume → "),
         (r" → ", ", then "),
         (r"\bserve (?=\S)", "use "),
         (r"step (\d+)/(\d+)", r"Step \1 of \2"),
@@ -116,7 +116,7 @@ def status_copy(data):
             )
         )
     if data.get("paused") and not reason.startswith("pausing"):
-        return "Paused", "Turn Learning on to continue"
+        return "Paused", "Run songe resume to continue"
     if reason.startswith("pausing · "):
         # Progress is saved first, so the work picks up where it stopped.
         return "Pausing", capitalize(reason[10:]) + " · saving progress"
@@ -147,7 +147,8 @@ def status_copy(data):
             " · retries automatically"
         )
     if unsupported := re.match(r"unsupported · (.+)", reason):
-        return "Not supported yet", f"{unsupported[1]} · Choose another model"
+        # Next says "Choose another model"; Now names the model once.
+        return "Not supported yet", unsupported[1]
     if reason.startswith("preparing examples"):
         return "Preparing training data", re.sub(
             r"(\d+) examples waiting to learn",
@@ -216,13 +217,16 @@ def status_copy(data):
             ) else "Starts when idle"
         return ready, "Starts when idle · " + quiet.replace("/", " of ", 1)
     if "proxy requests in flight" in reason:
+        if tools := re.search(r"waiting up to (\d+) min for the agent's tool results", reason):
+            return "In use", f"The agent is running tools · learning waits up to {tools[1]} min"
         return "In use", "Continues after this conversation"
     if "checks passed" in reason:
         return "Update ready", "Applies when idle"
     if "the model server" in reason:
         # LM Studio (or another server) is closed: nothing is wrong with Songe.
         return "Model server not running", "Start it · retries automatically"
-    if "serving retained" in reason:
+    # "serving retained": the same failure as older services word it.
+    if re.search(r"learning failed · current version kept|serving retained", reason):
         return "Retrying after an error", "Current version kept · run songe doctor"
     if re.search(r"failed|doctor|unavailable", reason, re.I) and raw.startswith(
         "waiting"
@@ -414,6 +418,9 @@ def base_summary(model, data):
             "",
             re.sub(r" not supported yet$", "", readable(model.get("reason"))),
         )
+        # A reason that only repeats the title ("unsupported") is left out.
+        if detail.lower() in {"unsupported", "not supported yet"}:
+            detail = ""
         return "Not supported yet", " · ".join(
             filter(None, (detail, may_not_load(model)))
         )
@@ -607,7 +614,7 @@ def flow_state(value):
         ),
         (
             r"(?i)^Sleep could not complete; current version preserved$",
-            "a check failed · current version kept · retries automatically",
+            "learning failed · current version kept · retries automatically",
         ),
         (
             r"^[Nn]eeds ([\d.]+) GB free on (.+?); ([\d.]+) GB available$",
@@ -794,3 +801,64 @@ def flow_line(stage, text):
             else "measuring smaller sizes"
         )
     return text
+
+
+# Learn with a cloud model (songe.cloud). Raise the version when the
+# substance changes: everyone who turned it on accepts the new text again.
+CLOUD_DISCLAIMER_VERSION = 1
+CLOUD_DISCLAIMER_TITLE = "Learn with a cloud model"
+
+
+def cloud_disclaimer(terms_url=""):
+    """What is sent, to whom and why, in plain words (CLI and page)."""
+    terms = (
+        f"The provider's terms apply ({terms_url})."
+        if terms_url
+        else "The provider's terms apply."
+    )
+    return [
+        "This is optional and off unless you turn it on.",
+        "Your agent keeps running on your own model; only the nightly Dream uses the"
+        " cloud model.",
+        "During a Dream, Songe sends the moments it learns from to the provider you"
+        " choose: the conversation up to that moment, your feedback, and your agent's"
+        " answers. The cloud model explains what went wrong and checks whether the new"
+        " version does better.",
+        "Before anything is sent, keys, tokens and passwords are removed and your home"
+        " folder is shown as ~. Code and file contents in those moments are sent.",
+        "Spending stops at a nightly budget you set. Every call is listed in the"
+        " Dream's record.",
+        terms + " Some providers restrict using their outputs to train other models;"
+        " Songe trains your local model on what it learns. You decide whether that"
+        " fits.",
+        "Turning it off stops all calls at once.",
+    ]
+
+
+def money(usd):
+    if usd is None:
+        return "cost unknown"
+    return f"${usd:.2f}" if usd >= 0.01 or usd == 0 else "<$0.01"
+
+
+def context_size(tokens):
+    if not tokens:
+        return ""
+    if tokens >= 1_000_000:
+        return f"{round(tokens / 1_000_000, 1):g}M context"
+    return f"{round(tokens / 1000):g}k context"
+
+
+def cloud_line(cloud):
+    """`songe status`: one line while cloud learning is on (or why Songe
+    turned it off), else None."""
+    if not cloud or not cloud.get("enabled"):
+        if cloud and cloud.get("off_reason"):
+            return f"Cloud learning off · {cloud['off_reason']}"
+        return None
+    tonight = cloud.get("tonight") or {}
+    spent = money(tonight.get("usd", 0.0)) if tonight.get("cost_known", True) else "cost unknown"
+    return (
+        f"Cloud learning on · {cloud.get('model')} via {cloud.get('provider_label')}"
+        f" · {spent} of {money(cloud.get('budget_usd'))} tonight"
+    )

@@ -2,13 +2,15 @@
 
 At each held-out moment (the step the user reacted to, or a held-out practice
 scene) the version in use and the candidate answer from the context alone.
-The same action is a tie. A different one goes to the original base model,
-shown the user's request, what should guide the answer (their feedback, or
-the lesson) and the two answers in an order that hides which is new: a win,
-a loss or a tie. When it says "both" or "neither", when its two readings
-disagree or cannot be read, the moment is a tie. The feedback-aware
-teacher's preference does not break it: training pulls the candidate
-towards that preference, so it would count the training itself as a win.
+The same action as written (quick.identical) is a tie. Of two different ones each is shown on its own to
+the original base model, with the user's request and what should guide the
+answer (their feedback, or the lesson): does this answer do what was asked,
+yes or no. A win when only the candidate's does, a loss when only the
+answer in use does, a tie when both or neither do or a reply cannot be
+read. The judge is never asked which of two answers it prefers (outcome
+says why). The feedback-aware teacher's preference does not break a tie:
+training pulls the candidate towards that preference, so it would count
+the training itself as a win.
 
 The same answers are also written at a few moments the lessons are not
 about (unrelated, acts_differently): how often the candidate acts
@@ -22,34 +24,30 @@ diagnostic: it scored the original model's text, not the candidate's.
 from __future__ import annotations
 
 import logging
+import re
 
-from ..quick import differs, verdict_of, visible
+from ..quick import differs, identical, verdict_of, visible
 from .examples import answer
 from .prompts import paired_prompts, render
 
 ANSWER_TOKENS = 384   # each version's answer: long enough for a tool call
-JUDGE_TOKENS = 48     # {"follows": "B"}, with room for a short preamble
+JUDGE_TOKENS = 48     # {"follows": "yes"}, with room for a short preamble
 PER_UNIT = 3          # moments per conversation or lesson (its last ones)
 MOMENTS = 24          # moments per Dream at most
 UNRELATED = 8         # confirmed successes answered again, one per conversation
 
 logger = logging.getLogger("songe")
 
-JUDGE = """A user asked a coding agent:
+DOES = """A user asked a coding agent:
 {request}
 
-What the answer should follow (the user's later feedback, or a lesson):
+The user's feedback on an earlier answer of this kind (or a lesson):
 {guide}
 
-Two answers the agent could give at this moment:
+The agent's answer now:
+{answer}
 
-Answer A:
-{a}
-
-Answer B:
-{b}
-
-Which answer better follows it? Reply as JSON: {{"follows": "A"}}, {{"follows": "B"}}, {{"follows": "both"}} or {{"follows": "neither"}}."""
+Does this answer do what the feedback asks? Judge only that, not whether the answer is long, complete or helpful. Reply as JSON: {{"follows": "yes"}} or {{"follows": "no"}}."""
 
 
 def shown(a, limit=1500):
@@ -130,26 +128,33 @@ def request_of(step):
     return ""
 
 
-def write(backend, step):
-    """The loaded version's own answer at this moment (deterministic)."""
+def write(backend, step, max_tokens=ANSWER_TOKENS, notes=""):
+    """The loaded version's own answer at this moment (deterministic).
+    notes: the lessons block it is served with, put where the proxy puts it."""
+    if notes:
+        from ..proxy import with_lessons
+
+        step = step | {"context": with_lessons(step.get("context") or [], notes)}
     student, _ = paired_prompts(backend.tokenizer, step, backend.config)
-    y, text, _ = backend.sample(student, deterministic=True, max_tokens=ANSWER_TOKENS)
+    y, text, _ = backend.sample(student, deterministic=True, max_tokens=max_tokens)
     return {"tokens": list(y), **answer(text, backend.tokenizer, step.get("tools"))}
 
 
-def answers(backend, journal, steps, name, check, kept_as=None):
+def answers(backend, journal, steps, name, check, kept_as=None, notes=""):
     """Every moment's answer by the loaded version, resumable. kept_as: a
-    KeptMeasurements (the incumbent's answers, reused on later Dreams)."""
-    from ..steps import revision_id
+    KeptMeasurements (the incumbent's answers, reused on later Dreams).
+    notes: the lessons block the version is served with (write)."""
+    from ..steps import digest, revision_id
     from .evaluate import kept
 
+    served = [digest(notes)[:16]] if notes else []
     out = {}
     for step in steps:
         check()
         out[step["id"]] = journal.unit(
-            f"judged-{name}-{step['id']}",
-            lambda step=step: kept(kept_as, f"answer{ANSWER_TOKENS}", [step["id"], revision_id(step)],
-                                   lambda: write(backend, step)),
+            "-".join(["judged", name, *served, step["id"]]),
+            lambda step=step: kept(kept_as, f"answer{ANSWER_TOKENS}", [step["id"], revision_id(step), *served],
+                                   lambda: write(backend, step, notes=notes)),
         )
     return out
 
@@ -172,34 +177,53 @@ def ask(backend, prompt):
     return (PREFILL + text) if start else text
 
 
-def outcome(backend, step, before, after):
-    """win / loss / tie for the candidate at this moment, and why. Runs on
-    the original base weights (no self-preference)."""
-    if not differs(before, after):
-        return "tie", "same"
-    # Asked in both orders: a win or loss counts only when the judge picks
-    # the same answer both times (live: a 3B judge called near-identical
-    # pairs wins; a position preference flips with the order).
+def does(backend, step, answer):
+    """Whether this answer, on its own, does what the user's feedback at this
+    moment asks: True, False, or None when the judge's reply cannot be read.
+    Asked of the original base weights (no self-preference)."""
     request, guide = request_of(step) or "(not shown)", guide_of(step) or "(none)"
-    picks = []
-    for swap in (False, True):
-        a, b = (after, before) if swap else (before, after)
-        prompt = JUDGE.format(request=request, guide=guide, a=shown(a), b=shown(b))
-        with backend.base():
-            text = ask(backend, prompt)
-        pick = verdict_of(text, swap)
-        if pick is None:
-            # Live: about 4 of 14 replies could not be read; what they say.
-            logger.info("judge_unreadable %s: %r", step["id"], text[:200])
-        picks.append(pick)
-    verdict = picks[0] if picks[0] == picks[1] else ("both" if None not in picks else None)
-    if verdict == "after":
+    with backend.base():
+        text = ask(backend, DOES.format(request=request, guide=guide, answer=shown(answer)))
+    found = verdict(text)
+    if found is None:
+        # Live: about 4 of 14 replies could not be read; what they say.
+        logger.info("judge_unreadable %s: %r", step["id"], (text or "")[:200])
+        return None
+    return found
+
+
+def verdict(text):
+    """True for yes, False for no, None when the reply says neither. The
+    begun reply ('{"follows": "yes"...'), else the JSON anywhere after a
+    preamble or a thought (a tokenizer without the prefill); "not sure" or
+    "nope" is not a no."""
+    text = text or ""
+    found = re.match(r'\s*\{\s*"follows"\s*:\s*"\s*(yes|no)(?![a-z])', text, re.I) or re.search(
+        r'"follows"\s*:\s*"\s*(yes|no)\s*"', visible(text), re.I)
+    return found.group(1).lower() == "yes" if found else None
+
+
+def outcome(backend, step, before, after):
+    """win / loss / tie for the candidate at this moment, and why.
+
+    Each answer is judged on its own against the user's feedback: a win when
+    only the candidate's does what was asked, a loss when only the answer in
+    use does, a tie otherwise. The judge is never asked to prefer one of two
+    answers. Asked that (in both orders, counting only an agreeing pick), a
+    4B judge gave a verdict on two of three pairs that differed in anything,
+    a fenced command against the bare one, a sentence against the bare date,
+    in either direction: a candidate no check of the eight test habits
+    found worse at any of 24 moments was refused as better on 3, worse on 8."""
+    if identical(before, after):
+        return "tie", "same"
+    was, now = does(backend, step, before), does(backend, step, after)
+    if was is None or now is None:
+        return "tie", "unclear"
+    if now and not was:
         return "win", "judge"
-    if verdict == "before":
+    if was and not now:
         return "loss", "judge"
-    # Both, neither, two different picks or no readable answer: a tie. The
-    # teacher's preference is what training fits, so it is not asked here.
-    return "tie", verdict or "unclear"
+    return "tie", "both" if now else "neither"
 
 
 def judge(backend, journal, steps, before, after, name, check):
@@ -213,6 +237,110 @@ def judge(backend, journal, steps, before, after, name, check):
         )
         rows.append({"id": step["id"], "conversation": step["conversation"], "outcome": result[0], "by": result[1]})
     return rows
+
+
+LEARNED_SCENES = 3    # held-out scenes asked per lesson
+LEARNED_TOKENS = 128  # the candidate's answer there: a habit shows early
+
+
+def follows(backend, step, answer):
+    """Does this answer, written without the lesson's note, do what the note
+    asks as well as the teacher's stored answer (written with it)? The
+    practice check's question (practice.prompts.CHANGES), asked of the
+    original base in both orders: yes when it names this answer or both,
+    both times. The same action as the teacher's is a yes without asking."""
+    from ..practice.prompts import CHANGES
+
+    taught = {"text": (step.get("teacher_answer") or {}).get("content") or "", "tool_calls": []}
+    if not visible(taught["text"]):
+        return False
+    if not differs(taught, answer):
+        return True
+    request, guide = request_of(step) or "(not shown)", guide_of(step) or "(none)"
+    # Yes when it names this answer or both in one order at least. Asked for
+    # both orders, a judge that names whichever answer comes first fails an
+    # answer it cannot tell from the teacher's, which is "as well as the
+    # teacher". Measured on 133 scenes with a mechanical check: of 100
+    # answers that follow, both orders passed 61, one order 82; of 33 that
+    # do not, 1 and 3.
+    named = 0
+    for swap in (False, True):
+        a, b = (answer, taught) if swap else (taught, answer)
+        with backend.base():
+            text = ask(backend, CHANGES.format(request=request, guide=guide, a=shown(a), b=shown(b)))
+        named += verdict_of(text, swap) in ("after", "both")
+    return named > 0
+
+
+def learned(backend, journal, lessons, scenes, name, check):
+    """Which of the prompt's lessons the loaded candidate follows without
+    their note: [{"id", "text", "signals", "scenes", "follows", "learned"}].
+
+    lessons: the lessons in the prompt (quick.active), each with the signals
+    it stands for. scenes: {signal id: its held-out practice scenes}, never
+    trained on. Up to LEARNED_SCENES of a lesson's scenes are answered by the
+    candidate as it would be served once this lesson's note has left: with
+    the other lessons' notes in the prompt and without its own. (Live: a
+    version that used pnpm on 11 of 16 requests with no notes in the prompt
+    did on 1 of 16 with the uv note beside it; tested with no notes at all,
+    the pnpm note left and the habit fell from 10 of 16 to 2.) The lesson is
+    learned when every answer follows it as well as the teacher's does. A
+    lesson with no held-out scene cannot be shown learned, so its note
+    stays."""
+    from .. import quick
+
+    out = []
+    for lesson in lessons:
+        beside = quick.block([other for other in lessons if other.get("id") != lesson.get("id")])
+        own = {
+            s["id"]: s
+            for signal in lesson.get("signals") or []
+            for s in scenes.get(signal, [])
+            if (s.get("teacher_answer") or {}).get("content")
+        }
+        own = [own[i] for i in sorted(own)][:LEARNED_SCENES]
+        passed = 0
+        for step in own:
+            check()
+            passed += bool(journal.unit(
+                f"learned-{name}-{step['id']}",
+                lambda step=step, beside=beside: follows(
+                    backend, step, write(backend, step, LEARNED_TOKENS, notes=beside)
+                ),
+            ))
+        out.append({"id": lesson.get("id"), "text": lesson.get("text"), "signals": list(lesson.get("signals") or []),
+                    "scenes": len(own), "follows": passed, "learned": bool(own) and passed == len(own)})
+    return out
+
+
+def learned_lessons(backend, journal, store, name, check):
+    """learned() for this store: the lessons in its prompt against their
+    held-out practice scenes. One cluster's scenes stand for every signal
+    that teaches the same thing (practice.store.cluster_of)."""
+    from .. import quick
+    from ..practice.pool import practice_steps
+    from ..practice.store import cluster_of
+
+    same, scenes = cluster_of(store), {}
+    for s in practice_steps(store, split="held_out"):
+        for member in same.get(s["signal_id"], [s["signal_id"]]):
+            scenes.setdefault(member, []).append(s)
+    return learned(backend, journal, quick.active(store), scenes, name, check)
+
+
+def kept_back(lessons, rows, session):
+    """The lessons that passed the note test and keep their note all the
+    same: {lesson id}. lessons: learned()'s rows. rows: the judged moments,
+    the candidate answering without those lessons' notes. session: {signal
+    id: the conversation it came from}. A lesson whose own conversation is
+    among the moments judged worse is not learned as the user is served: on
+    three held-out scenes the candidate passed, in the user's conversation it
+    did not."""
+    lost = {r["conversation"] for r in rows if r["outcome"] == "loss"}
+    return {
+        row["id"] for row in lessons
+        if row["learned"] and {session.get(sig) for sig in row["signals"]} & lost
+    }
 
 
 def examples(steps, before, after, rows, limit=3):

@@ -5,6 +5,8 @@ import asyncio
 import copy
 import json
 
+import pytest
+
 from songe.practice import store as practice
 from songe.practice.checks import STOCK_LESSONS, placebo_for
 from songe.reading import store as reading
@@ -33,9 +35,17 @@ class Writer(FakeReader):
         return await super().ask(prompt, schema, name)
 
 
-def written(store, scene=None, pick=None, per_signal=1):
-    record_session(store)
+def corrected_twice(store):
+    """The same correction in two conversations. Judged a change wanted once
+    (test_reading.ANSWERS), it is a lesson to practise only when it comes up
+    again, as it is a note only then (quick.admitted)."""
+    record_session(store, ask="fix the other failing test")
+    record_session(store)  # the newest: the one its scenes are framed on
     asyncio.run(reading.read(store, FakeReader()))
+
+
+def written(store, scene=None, pick=None, per_signal=1):
+    corrected_twice(store)
     writer = Writer(scene, pick)
     asyncio.run(practice.write(store, writer, per_signal))
     return practice.practice(store), writer
@@ -57,7 +67,7 @@ def test_a_scene_is_framed_on_the_logged_request_and_kept(store):
     # The prompt carries the lesson and a short summary, never the session.
     assert "Check which file the failing test covers" in writer.prompts[0]
     assert "fix the failing test" not in writer.prompts[0]
-    # One session only: the forced choice still runs, against a stock lesson.
+    # One lesson only: the forced choice still runs, against a stock lesson.
     assert writer.asked == ["dream", "matters"] and row["checks"]["matters"] is True
     assert any(f": {text}\n" in writer.prompts[1] for text in STOCK_LESSONS)
 
@@ -78,8 +88,7 @@ def test_a_scene_with_an_unknown_tool_does_not_build(store):
 
 
 def test_the_forced_choice_drops_scenes_about_something_else(store):
-    record_session(store)
-    asyncio.run(reading.read(store, FakeReader()))
+    corrected_twice(store)
     # A second session with a different lesson gives the placebo.
     with store.connect() as db:
         db.execute(
@@ -114,7 +123,7 @@ def test_a_repeated_lesson_from_another_session_cannot_be_its_own_placebo(store)
 
 
 def test_a_first_session_scene_about_something_else_is_dropped(store):
-    # With one session there is no other lesson to compare with; the scene
+    # With one lesson there is no other lesson to compare with; the scene
     # used to be kept unchecked (matters stayed None, and None is not a drop).
     row = written(store, pick="neither")[0][0]
     assert row["checks"]["matters"] is False and row["drop"] == "matters"
@@ -148,8 +157,9 @@ def test_scenes_are_written_up_to_the_target_and_go_with_their_signal(store):
     counts = practice.counts(store)
     assert counts == {"written": 2, "kept": 2, "dropped": 0, "dropped_by": {}}
     # The session is read again and its signal is gone: so are its scenes.
+    session = rows[0]["signal"]["session"]
     with store.connect() as db:
-        session, ids = next(iter(timeline.sessions(db).items()))
+        ids = timeline.sessions(db)[session]
     reading.save(store, session, max(ids) + 1, [], [])
     assert practice.practice(store) == []
 
@@ -427,6 +437,55 @@ def test_a_server_that_ignores_the_reasoning_switches_is_given_more_room(store, 
     assert rows[-1]["drop"] == "changes" and rows[-1]["id"].endswith("#v4")
 
 
+def test_the_plain_writer_sees_the_answer_the_feedback_was_about(store, monkeypatch):
+    """A lesson about the form of an answer ("just the code", "no comments")
+    can only be practised on a request whose answer has that form. Shown the
+    request alone, the writer also wrote questions about code that are
+    answered in prose; the note changed nothing there. With the logged answer
+    in front of it, it is asked for messages a good answer to which has the
+    same form. The lesson itself is still not shown. Measured on a rented
+    card (Qwen3.5-4B, 384 scenes for 16 lessons): 158 teaching scenes before,
+    208 with the answer shown."""
+    monkeypatch.setattr(practice, "answered", lambda store, signal: "Run `python -m pip install requests`.")
+    writer = ChatWriter()
+    rows = chat_written(store, monkeypatch, writer)
+    asked = writer.prompts[0]
+    assert "The assistant answered:\nRun `python -m pip install requests`." in asked
+    assert "the same form as the answer above" in asked and "3 new messages" in asked
+    assert "uv" not in asked
+    assert [r["drop"] for r in rows] == [None, None, None]
+    # No logged answer (an old store, a tool call with no text): as before.
+    monkeypatch.setattr(practice, "answered", lambda store, signal: "")
+    writer = ChatWriter()
+    chat_written(store, monkeypatch, writer)
+    assert "The assistant answered" not in writer.prompts[0]
+
+
+def test_many_plain_messages_are_asked_for_twelve_at_a_time(store, monkeypatch):
+    """One call for all of a lesson's messages needs 150 tokens of JSON per
+    message and a small model stops early or repeats itself. Twelve are asked
+    for per call, and a later call is told what is written already: asked the
+    same question twice, the reader would hand back the first answer."""
+
+    class Many(ChatWriter):
+        async def ask(self, prompt, schema, name, *, temperature=0, max_tokens=None):
+            if name != "dream":
+                return await super().ask(prompt, schema, name, temperature=temperature, max_tokens=max_tokens)
+            self.asked.append(name)
+            self.prompts.append(prompt)
+            count = int(prompt.split("Write ", 1)[1].split(" ", 1)[0])
+            done = prompt.count("\n- Which command adds package")
+            return {"messages": [f"Which command adds package number {done + i}?" for i in range(count)]}
+
+    writer = Many()
+    rows = chat_written(store, monkeypatch, writer, variants=tuple(range(1, 15)))
+    dreams = [p for p, name in zip(writer.prompts, writer.asked, strict=True) if name == "dream"]
+    assert len(dreams) == 2 and "Write 12 new messages" in dreams[0] and "Write 2 new messages" in dreams[1]
+    assert "Already written" not in dreams[0]
+    assert "Already written, write different ones:\n- Which command adds package number 0?" in dreams[1]
+    assert len({r["messages"][-1]["content"] for r in rows}) == 14
+
+
 def test_fewer_plain_messages_than_asked_leave_scenes_that_did_not_build(store, monkeypatch):
     writer = ChatWriter(messages=["Add pandas for me, which command?", " add pandas for me, which command? ", 7])
     rows = chat_written(store, monkeypatch, writer)
@@ -438,3 +497,53 @@ def test_a_plain_message_copied_from_the_chat_is_dropped(store, monkeypatch):
     writer = ChatWriter(messages=["How do I install requests?"])
     rows = chat_written(store, monkeypatch, writer, variants=(1,))
     assert rows[0]["drop"] == "not_copy" and writer.replied == []
+
+
+def test_the_scenes_of_a_plain_chat_are_answered_several_at_a_time(store, monkeypatch):
+    """A scene costs two answers and a judgement from the served model. Asked
+    one after another, a 27B on vLLM wrote 8 scenes a minute while the server
+    sat at one running request; a Dream of 16 lessons with 60 scenes each
+    would have practised for two hours. The scenes of one plain-chat lesson
+    share nothing (no workspace, no tools), so AT_ONCE of them are answered
+    at the same time. Scenes with tools stay one at a time."""
+
+    class Slow(ChatWriter):
+        running = most = 0
+
+        async def reply(self, messages, *, max_tokens, temperature=0, think=None):
+            Slow.running += 1
+            Slow.most = max(Slow.most, Slow.running)
+            await asyncio.sleep(0.01)
+            Slow.running -= 1
+            return await super().reply(messages, max_tokens=max_tokens)
+
+    many = [f"Which command adds package number {n}?" for n in range(20)]
+    rows = chat_written(store, monkeypatch, Slow(messages=many), variants=tuple(range(1, 21)))
+    assert sorted(r["variant"] for r in rows) == list(range(1, 21))
+    assert 1 < Slow.most <= 2 * practice.AT_ONCE
+
+
+@pytest.mark.parametrize("shell,read", [("run_shell", "read_file"), ("Bash", "Read"), ("execute_bash", "view")])
+def test_a_scene_uses_the_agents_own_names_for_shell_and_read(shell, read):
+    """Agents name their tools differently; a scene's generic shell, grep and
+    read steps become the agent's own calls instead of being dropped."""
+    from songe.practice.frame import build, frame_from_request
+
+    def tool(name, arg):
+        return {"type": "function", "function": {"name": name, "parameters": {
+            "type": "object", "properties": {arg: {"type": "string"}}, "required": [arg]}}}
+
+    request = {"messages": [{"role": "user", "content": "x"}], "tools": [tool(shell, "command"), tool(read, "path")]}
+    frame = frame_from_request(request, "shop")
+    scene = {
+        "request": "Tidy the cache.", "files": [{"path": "app.py", "content": "def main():\n    pass\n"}],
+        "steps": [
+            {"say": "", "tool": "grep", "args": {"pattern": "def main", "path": ""}, "output": ""},
+            {"say": "", "tool": "read", "args": {"path": "app.py"}, "output": ""},
+        ],
+        "moment": {"kind": "tool_result", "step": {"say": "", "tool": "shell", "args": {"command": "ls"}, "output": "app.py"}},
+    }
+    messages, problems, _ = build(scene, frame)
+    assert problems == []
+    called = [c["function"]["name"] for m in messages for c in m.get("tool_calls") or []]
+    assert called == [shell, read, shell]

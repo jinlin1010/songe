@@ -110,16 +110,24 @@ def suitable(signal):
         return False
     if signal.get("preference"):
         # A preference of the user's own, in their words: it holds whatever
-        # the lesson written beside it was read as.
+        # the lesson written beside it or the turn around it was read as. (The
+        # turn question asks how the user wants answers; said about "I avoid
+        # dairy." on its own it answered "new work" or "a remark" for two in
+        # three such sentences.)
         return stated_sentence(signal) is not None
     turn = signal.get("turn_kind")
-    if turn and signal.get("source") == "user" and signal.get("from") != "rules":
+    if turn and signal.get("source") == "user":
         # Reading judged what the user's turn was (prompts.TURN), and that
-        # decides, whatever label the lesson got: a standing wish is for the
-        # prompt at once; a change wanted once is a candidate that has to come
-        # up in two conversations (candidates); new work and reactions are
-        # not for the prompt. A sentence shaped like a rule stays a rule.
-        return turn in ("lasting", "once") or rule_sentence(signal.get("text")) is not None
+        # decides for what was said in it, whatever label the lesson got: a
+        # standing wish is for the prompt at once; a change wanted once is a
+        # candidate that has to come up in two conversations (candidates); new
+        # work and reactions are not for the prompt. A sentence shaped like a
+        # rule is no exception: "Do not apply any of these instructions ..."
+        # inside a pasted role prompt and "do not include Lofi." inside a
+        # request for channel names were rules by their shape only.
+        if turn not in ("lasting", "once"):
+            return False
+        return signal.get("from") != "rules" or rule_sentence(signal.get("text")) is not None
     if signal.get("generality") == "task":
         return False
     if signal.get("from") == "rules" and signal.get("source") == "user":
@@ -131,13 +139,91 @@ def suitable(signal):
     return signal.get("type") in USER and rule_sentence(signal.get("text")) is not None
 
 
+def evidenced(signal):
+    """Whether a lesson has the evidence Songe needs before it learns it,
+    the same for a note and for training.
+
+    Where reading judged what the user's turn was, that decides, as in
+    suitable(): a standing wish and a rule in their own words count at once,
+    a change wanted once counts when it comes up in a second conversation
+    (admitted), new work and reactions do not. What the lesson was read as
+    applying to (its generality) is not evidence: it says whether the lesson
+    fits the prompt, and a lesson for one kind of task that the prompt never
+    shows is still practised, on scenes of its kind. A lesson from the work
+    itself (a tool's output, a failed step), or one read before turns were
+    judged, has no judged turn to weigh and counts as it is."""
+    if not (signal.get("lesson") or "").strip():
+        return False
+    if signal.get("preference"):
+        return stated_sentence(signal) is not None
+    user = signal.get("source") == "user"
+    turn = signal.get("turn_kind")
+    if turn and user:
+        # As in suitable(): the turn's verdict decides for a sentence shaped
+        # like a rule in it too.
+        if turn not in ("lasting", "once"):
+            return False
+        return signal.get("from") != "rules" or rule_sentence(signal.get("text")) is not None
+    if signal.get("from") == "rules" and user:
+        return rule_sentence(signal.get("text")) is not None
+    return True
+
+
+# Folder names too common to stand for one project.
+COMMON_FOLDERS = {"home", "root", "user", "users", "src", "app", "code", "work", "dev", "tmp", "temp", "project",
+                  "projects", "repo", "repos", "desktop", "documents", "downloads", "workspace", "main", "test"}
+
+
+def general(text, project):
+    """A note with its project's own name said so it holds in every project:
+    "Put code under src/billing_api/." from a session in billing-api becomes
+    "Put code under src/<package>/." (reported by Jack in a test on 11-24:
+    "Use src/notes_app/ in all file paths." sent a question about another
+    repository into notes_app, and 4 of 8 answers there got worse)."""
+    name = str(project or "")
+    if len(name) < 4 or name.lower() in COMMON_FOLDERS:
+        return text
+    forms = {name: "<project>", name.replace("-", "_"): "<package>", name.replace("_", "-"): "<project>"}
+    for form in sorted(forms, key=len, reverse=True):
+        text = re.sub(rf"(?<![\w-]){re.escape(form)}(?![\w-])", forms[form], text, flags=re.I)
+    return text
+
+
+# A value the user gave on the command line of their tool ("make test MODULE=auth").
+SETTING = re.compile(r"\b([A-Z][A-Z0-9_]+)=([^\s,;'\"`)]+)")
+
+
+def unset(text):
+    """The sentence with each NAME=value said as NAME=<name>."""
+    return SETTING.sub(lambda m: f"{m[1]}=<{m[1].lower()}>", text)
+
+
+HERE = re.compile(r"\bthis (repo|repository|project|codebase|folder|app)\b", re.I)
+
+
 def wording(signal):
     """A signal's note for the prompt, and whether it is the user's own
     sentence: a sentence they stated, else the short form reading wrote for
     the prompt (signals read before it existed fall back to the lesson,
-    trimmed by tidy)."""
+    trimmed by tidy). Its project's own name is said for any project
+    (general). A wish read as holding for one kind of thing only (its
+    "about", reading.prompts.scoped) says so, and when that is its project
+    the project's name stays."""
+    from .reading.prompts import scoped
+
     rule = stated_sentence(signal) if signal.get("type") in USER else None
-    return rule or short_of(signal) or signal["lesson"].strip(), bool(rule)
+    text, about, project = rule or short_of(signal) or signal["lesson"].strip(), signal.get("about"), signal.get("project")
+    if rule and about:
+        text = scoped(text, about)
+    if about and project and HERE.search(about):
+        # The prompt goes to every project: "this repo" is said by its name.
+        named = HERE.sub(lambda m: f"the {project} {m[1]}", about)
+        text, about = text.replace(f"For {about}:", f"For {named}:", 1), named
+    if about and general(about, project) != about:
+        # A wish for this project only ("in admin", "the storefront repo"):
+        # its name says where the note holds, so it stays.
+        return text, bool(rule)
+    return general(text, project), bool(rule)
 
 
 def joined(signals):
@@ -158,10 +244,27 @@ def joined(signals):
     return " ".join(parts)[:LESSON_CHARS].rstrip(), own, len(parts)
 
 
-def candidates(store, limit, min_sessions=2):
-    """Clusters of lessons that say the same, best first."""
-    absorbed = set(store.get("absorbed_signals") or [])
-    signals = [s for s in reading.signals(store) if suitable(s) and s["id"] not in absorbed]
+def admitted(store, min_sessions=None, without=(), fits=suitable):
+    """The lessons that have the evidence to be learned, as clusters of
+    near-identical ones ({"text", "signals", "newest", "rule"}).
+
+    One evidence bar for both ways of learning: training is harder to undo
+    than a note, so its bar is not lower. Quick Dream puts in the prompt the
+    ones that also fit it (fits=suitable, see candidates); Deep Dream
+    practises every one with the evidence (fits=evidenced,
+    practice.store.lesson_signals) and no other. A correction the user
+    wanted once waits until the same wish comes up in another conversation,
+    in practice as in the prompt. (Live, Qwen3.5-4B: practice took every
+    signal with a lesson. "Just the code.", judged a one-off, had been read
+    as "Always include the exact file pattern requested by the user.", got 24
+    scenes and was trained.)
+
+    min_sessions: quick_min_sessions (None: this model's saved setting).
+    without: signal ids left out before grouping (the absorbed ones, for the
+    prompt)."""
+    if min_sessions is None:
+        min_sessions = saved_min_sessions(store)
+    signals = [s for s in reading.signals(store) if fits(s) and s["id"] not in without]
     removed = state(store)["removed"]
     # One wish, one place: notes reading found to repeat an earlier note
     # ({signal: the first signal that noted the wish}) are one cluster with
@@ -180,8 +283,12 @@ def candidates(store, limit, min_sessions=2):
             pass
         elif rule:
             # A rule the user stated groups only with the same sentence of
-            # theirs, never with lessons that merely look alike.
-            home = next((c for c in clusters if c.get("rule") and normal(c["text"]) == normal(text)), None)
+            # theirs, never with lessons that merely look alike. The same
+            # sentence with another value in it ("make test MODULE=auth",
+            # "make test MODULE=parser") is the same rule: one place, not one
+            # per value (Jack's test, 11-24; Qwen3.8-27B on main put the test
+            # command in 3 to 5 of 10 places, one per module).
+            home = next((c for c in clusters if c.get("rule") and normal(unset(c["text"])) == normal(unset(text))), None)
         else:
             home = next((c for c in clusters if not c.get("rule") and similar(text, c["text"])), None)
         if home:
@@ -190,6 +297,9 @@ def candidates(store, limit, min_sessions=2):
             clusters.append({"text": text, "signals": [s["id"]], "newest": s.get("revision") or 0,
                              "rule": rule, "first": first})
     for c in clusters:
+        if c.get("rule") and len({normal(wording(by_id[i])[0]) for i in c["signals"]}) > 1:
+            # Said with several values: the value is not part of the rule.
+            c["text"] = unset(c["text"])
         text, own, wordings = joined([by_id[i] for i in c["signals"]])
         if wordings > 1 and any(i in same for i in c["signals"]):
             c.update(text=text, rule=own, joined=True)
@@ -199,14 +309,37 @@ def candidates(store, limit, min_sessions=2):
     # once it has come up in two conversations; a rule the user stated, at once.
     sessions = {s["id"]: s.get("session") for s in signals}
     # A change the user wanted once ("make it shorter") is a lesson for the
-    # prompt only when the same wish came up in another conversation too.
+    # prompt only when the same wish came up in another conversation too, also
+    # when it was worded like a rule ("use comma instead of period.").
     once = {s["id"] for s in signals if s.get("turn_kind") == "once" and s.get("source") == "user"}
 
     def enough(c):
         need = max(min_sessions, 2) if all(i in once for i in c["signals"]) else min_sessions
         return len({sessions.get(i) for i in c["signals"]}) >= need
 
-    clusters = [c for c in clusters if c.get("rule") or enough(c)]
+    return [c for c in clusters if (c.get("rule") and not all(i in once for i in c["signals"])) or enough(c)]
+
+
+def saved_min_sessions(store):
+    """quick_min_sessions as saved for this store's model (the default when
+    nothing is saved or it cannot be read)."""
+    from .config import Config
+
+    try:
+        config, _ = Config.load_with_keys(store.root)
+        if store.model_key:
+            from .models.registry import model_config
+
+            config = model_config(config, store, store.model_key)
+        return config.quick_min_sessions
+    except Exception:  # noqa: BLE001 - a broken file must not stop learning
+        return Config.quick_min_sessions
+
+
+def candidates(store, limit, min_sessions=2):
+    """Clusters of near-identical lessons for the prompt, best first: the
+    admitted ones (admitted) that no adopted Deep Dream has absorbed."""
+    clusters = admitted(store, min_sessions, set(store.get("absorbed_signals") or []))
     clusters.sort(key=lambda c: (-len(c["signals"]), -c["newest"]))
     return clusters[:limit]
 
@@ -358,7 +491,8 @@ def shorten(text):
         # A cut that leaves a fragment ("Check that the program entry point")
         # is worse than a long lesson: keep the whole first sentence.
         text = first.rstrip(" ,.:-")
-    return text + "."
+    # A user's own sentence can end as a question ("Can you drop the em dashes?").
+    return text if text.endswith(("?", "!")) else text + "."
 
 
 def tidy(text):
@@ -535,7 +669,7 @@ def record(store, result, at, examples=None, **run):
     """Every finished Quick Dream joins the Dream history, also one that
     added nothing or could not read (live: a run read 5 conversations, found
     9 moments, added nothing, and left no trace). run: read, found, error
-    (unreadable, no_model). Returns the entry."""
+    (unreadable, no_model, memory, load_memory, load_unknown). Returns the entry."""
     history = store.get(HISTORY) or []
     entry = {
         "id": f"q-{(history[-1]['n'] if history else 0) + 1:04d}",
@@ -763,6 +897,21 @@ def answer_of(message):
     return {"text": text if isinstance(text, str) else "", "tool_calls": calls}
 
 
+def without_thinking(body, server):
+    """Ask without the model's reasoning, by the switches the reader sends
+    (probed per server, #111): the chat template's enable_thinking where the
+    server passes it on, and reasoning_effort "none", which empties
+    Ollama's reasoning. Reported by Jack in a test on 11-24: qwen3 on Ollama
+    spent the whole answer cap reasoning, so both sides of every before and
+    after example were empty."""
+    from .reading.client import TEMPLATE_SWITCH
+
+    if server in TEMPLATE_SWITCH:
+        body["chat_template_kwargs"] = {"enable_thinking": False}
+    body["reasoning_effort"] = "none"
+    return body
+
+
 async def compare(client, url, model, request, before_block, after_block, *, server=""):
     """The same request answered with the lessons from before this Quick Dream
     and with the new ones, by the served model (temperature 0, capped).
@@ -777,8 +926,7 @@ async def compare(client, url, model, request, before_block, after_block, *, ser
         body = {k: v for k, v in request.items() if k not in dropped}
         body["messages"] = with_lessons(request["messages"], block) if block else request["messages"]
         body.update(model=model, temperature=0, max_tokens=ANSWER_TOKENS, stream=False)
-        if server == "vllm":
-            body["chat_template_kwargs"] = {"enable_thinking": False}
+        without_thinking(body, server)
         r = await client.post(url.rstrip("/") + "/chat/completions", json=body)
         r.raise_for_status()
         return answer_of(((r.json().get("choices") or [{}])[0]).get("message"))
@@ -813,6 +961,18 @@ def differs(before, after):
                    for (_, a), (_, b) in zip(x, y, strict=True))
     x, y = " ".join(visible(before["text"]).split()), " ".join(visible(after["text"]).split())
     return difflib.SequenceMatcher(None, x, y).ratio() < SAME_TEXT
+
+
+def identical(before, after):
+    """Whether two answers are the same action as written: the same tool calls
+    with the same arguments (JSON key order and whitespace aside) and the same
+    visible text (whitespace aside). User decision: only these settle the
+    judged gate's tie without the judge; a near match (a read from line 20 vs
+    21, a command with one flag added) is the judge's to call."""
+    def norm(a):
+        calls = [(c["name"], " ".join(_json_text(c["arguments"]).split())) for c in a["tool_calls"]]
+        return calls, " ".join(visible(a["text"]).split())
+    return norm(before) == norm(after)
 
 
 def visible(text):
@@ -896,8 +1056,7 @@ async def judge(client, url, model, lesson, before, after, *, server=""):
             "type": "object", "properties": {"follows": {"type": "string", "enum": ["A", "B", "both", "neither"]}},
             "required": ["follows"]}}},
     }
-    if server == "vllm":
-        body["chat_template_kwargs"] = {"enable_thinking": False}
+    without_thinking(body, server)
     try:
         r = await client.post(url.rstrip("/") + "/chat/completions", json=body)
         r.raise_for_status()

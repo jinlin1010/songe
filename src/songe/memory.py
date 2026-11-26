@@ -10,10 +10,41 @@ import threading
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field, replace
+from functools import lru_cache
 
 from .platform import Accel, Memory, current
 
 NORMAL, WARN, CRITICAL = 1, 2, 4
+
+
+@lru_cache(maxsize=1)
+def linux_mlx_accelerator():
+    # Keep the Vulkan context out of the long-running scheduler.
+    try:
+        info = json.loads(
+            subprocess.check_output(
+                [
+                    sys.executable,
+                    "-c",
+                    "import json, mlx.core as mx; print(json.dumps(mx.device_info()))",
+                ],
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise OSError("MLX could not identify its Linux training device") from exc
+    if isinstance(info, dict):
+        name = info.get("device_name")
+        if (
+            isinstance(name, str)
+            and name.startswith("Apple ")
+            and info.get("architecture") in ("honeykrisp", "borealis")
+            and info.get("unified_memory") == 1
+            and not info.get("simulated")
+        ):
+            return Accel("mlx", name)
+    raise OSError("MLX training requires a verified Apple unified-memory GPU on Linux")
 
 
 class TrainingPlatform:
@@ -22,6 +53,9 @@ class TrainingPlatform:
     def __init__(self, platform, config):
         self.platform, self.name = platform, platform.name
         self._songe_accelerators = set()
+        self.linux_mlx = self.name == "linux" and config.backend == "mlx"
+        if self.linux_mlx:
+            return
         requested = config.torch_options.get("device", "auto")
         devices = platform.accelerators() if platform.name != "darwin" else []
         if requested.startswith("xpu"):
@@ -78,6 +112,8 @@ class TrainingPlatform:
             raise OSError("Selected accelerator memory telemetry is unavailable")
 
     def accelerators(self):
+        if self.linux_mlx:
+            return [linux_mlx_accelerator()]
         if self.selected is None:
             return (
                 self.platform.accelerators()
@@ -330,7 +366,27 @@ def record_memory_stop(store, sample, *, calibration=False, nights_before=None):
         record = asdict(sample.memory) | {"stop_reason": sample.reason}
     else:
         record = asdict(sample)
+    import logging
     import time
+
+    from . import NAME
+
+    reason = record.get("stop_reason") or {}
+    reason = (reason.get("observed") or {}).get("trigger") or reason
+    vram = "".join(
+        f" {a['name']} {a['memory_free'] / 1e9:.1f} GB free"
+        for a in record.get("vram") or ()
+    )
+    logging.getLogger(NAME).info(
+        "memory_stop %s%s: %.1f of %.1f GB free, pressure %s, psi %s%s",
+        reason.get("rule", "memory_pressure"),
+        " (measuring)" if calibration else "",
+        record.get("available", 0) / 1e9,
+        record.get("total", 0) / 1e9,
+        record.get("pressure"),
+        record.get("psi"),
+        vram,
+    )
 
     store.set("last_memory_stop", record)
     # When (a measuring run that fails right after it ran out of memory too).

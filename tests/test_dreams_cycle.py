@@ -577,6 +577,18 @@ def test_each_stop_shows_its_own_wait():
     }
 
 
+def test_a_wait_carries_the_numbers_its_reason_names():
+    """The page could only say "Waits for free memory": have, need and unit
+    were always null, though the reason names them."""
+    from songe.cycle import wait_of
+
+    memory = "Waiting for memory: smallest calibrated work does not fit · 9.6 GB free, needs 13.2 GB"
+    assert wait_of(memory) == {"code": "memory", "have": 9.6, "need": 13.2, "unit": "GB"}
+    disk = "Needs 49.5 GB free on /; 31.3 GB available"
+    assert wait_of(disk) == {"code": "disk", "have": 31.3, "need": 49.5, "unit": "GB"}
+    assert wait_of("memory guard") == {"code": "memory", "have": None, "need": None, "unit": None}
+
+
 def test_the_last_result_says_whether_its_version_is_still_in_use(dreams):
     """Live run: after Undo the page still described v1's Dream as current."""
     from songe.cycle import model_learning
@@ -652,8 +664,9 @@ def test_a_kept_dream_says_which_check_it_failed():
 
 def test_the_gate_judges_what_each_version_writes(monkeypatch):
     """What the version in use and the candidate each write at a held-out
-    moment is compared: the same action ties; a different one goes to the
-    base model's blind judgement; the report's pairs are the moments won."""
+    moment is compared: the same action ties; of two different ones each is
+    judged by the base model on its own; the report's pairs are the moments
+    won."""
     import contextlib
 
     from songe.sleep import judged
@@ -669,9 +682,8 @@ def test_the_gate_judges_what_each_version_writes(monkeypatch):
             return contextlib.nullcontext()
 
         def sample(self, prompt, seed=None, *, deterministic=False, max_tokens=None):
-            if isinstance(prompt, str):  # the judge's question
-                new_is_a = prompt.index("Answer A:") < prompt.index("pnpm add") < prompt.index("Answer B:")
-                return [], verdicts.get("say", '{"follows": "%s"}' % ("A" if new_is_a else "B")), None
+            if isinstance(prompt, str):  # the judge's question, about one answer
+                return [], verdicts.get("say", '{"follows": "%s"}' % ("yes" if "pnpm add" in prompt else "no")), None
             text = '{"name": "shell", "arguments": {"command": "%s"}}' % (
                 "pnpm add lodash" if self.weight else "npm install lodash")
             return [self.weight], text, None
@@ -700,14 +712,183 @@ def test_the_gate_judges_what_each_version_writes(monkeypatch):
     assert shown[0]["feedback"] == "use pnpm here, never npm" and shown[2]["lesson"] == "Always use pnpm."
     # The judge does not decide: a tie, whatever it said. The teacher is not
     # asked (this backend has none): its preference is what training fits.
-    for say, why in (('{"follows": "both"}', "both"), ('{"follows": "neither"}', "neither"),
-                     ("Let me think about the two answers", "unclear")):
+    for say, why in (('{"follows": "yes"}', "both"), ('{"follows": "no"}', "neither"),
+                     ("Let me think about the answer", "unclear")):
         verdicts["say"] = say
         assert judged.outcome(backend, steps[0], before["s0"], after["s0"]) == ("tie", why)
     rows = judged.judge(backend, Journal(), steps, before, after, "scale-1.0", lambda: None)
     assert judged.summary(rows) == {"count": 0, "worse": 0, "same": 3, "checked": 3, "available": 3}
     # The same action: a tie, no judge asked.
     assert judged.outcome(backend, steps[0], before["s0"], before["s0"]) == ("tie", "same")
+
+
+def test_a_note_leaves_only_when_the_candidate_follows_its_lesson_without_it(store, monkeypatch):
+    """On held-out practice the candidate answers as it would be served once
+    the lesson's note has left: the other lessons' notes are in the prompt,
+    its own is not. A lesson is learned when every scene asked follows the
+    note as well as the teacher's stored answer does; one miss, or no
+    held-out scene to ask, and its note stays in the prompt.
+
+    Live (Qwen3.5-4B on a rented card): asked with no notes at all, a version
+    passed the pnpm test on three scenes, the note left, and with the three
+    notes that stayed in the prompt it used pnpm on 0 of 16 test requests (11
+    with no notes, 10 with the note back)."""
+    import contextlib
+
+    from songe import quick
+    from songe.sleep import judged
+
+    monkeypatch.setattr(judged, "paired_prompts", lambda tok, step, config: (
+        step["id"] + "|" + "".join(m["content"] for m in step["context"] if m["role"] == "system"), None))
+    monkeypatch.setattr(judged, "render", lambda tok, messages, tools, **kw: messages[0]["content"])
+    monkeypatch.setattr(judged, "answer", lambda text, tok, tools: {"text": text, "tool_calls": [], "valid": True})
+    monkeypatch.setattr(practice_pool, "held_out", lambda signal, extra=(), scene=None, trained=(): True)
+    wrote, asked = {}, []
+
+    def scene(signal, n, taught, candidate):
+        row = {"id": f"{signal}#{n}", "signal_id": signal, "tools": [], "teacher_note": f"Lesson: {signal}",
+               "messages": [{"role": "user", "content": f"request {signal} {n}"}],
+               "teacher_answer": {"content": taught, "finished": True}}
+        wrote["practice:" + row["id"]] = candidate
+        with store.connect() as db:
+            db.execute('INSERT INTO practice(id,model_id,signal_id,payload,kept,"drop",created)'
+                       " VALUES (?,?,?,?,1,NULL,0)", (row["id"], store.model_id, signal, json.dumps(row)))
+
+    for n in range(5):  # learned: every scene asked uses uv, in other words than the teacher's
+        scene("uv", n, f"Run `uv add package{n}` in the project folder.", f"uv add package{n}")
+    scene("pnpm", 0, "Use `pnpm add zod` here.", "pnpm add zod")  # one of two misses: the note stays
+    scene("pnpm", 1, "Use `pnpm add vite` here.", "npm install vite, as usual for JavaScript")
+    store.set(quick.KEY, {"version": 1, "updated_at": None, "removed": [], "lessons": [
+        {"id": "l1", "text": "Use uv.", "signals": ["uv"]},
+        {"id": "l2", "text": "Use pnpm.", "signals": ["pnpm"]},
+        {"id": "l3", "text": "Start with Yes, chef.", "signals": ["chef"]},  # never practised
+    ]})
+
+    class Fake:
+        tokenizer = config = None
+
+        def base(self):
+            return contextlib.nullcontext()
+
+        def sample(self, prompt, seed=None, *, deterministic=False, max_tokens=None):
+            if "Answer A:" not in prompt:  # the candidate, from the request alone
+                asked.append(prompt)
+                return [], wrote[prompt.split("|")[0]], None
+            a, b = prompt.split("Answer A:")[1].split("Answer B:")
+            follows = [any(w in x for w in ("uv add", "pnpm add")) for x in (a, b)]
+            return [], '{"follows": "%s"}' % {(1, 1): "both", (1, 0): "A", (0, 1): "B", (0, 0): "neither"}[
+                tuple(map(int, follows))], None
+
+    class Journal:
+        def unit(self, name, fn):
+            return fn()
+
+    rows = judged.learned_lessons(Fake(), Journal(), store, "scale-1.0", lambda: None)
+    assert [(r["id"], r["scenes"], r["follows"], r["learned"]) for r in rows] == [
+        ("l1", 3, 3, True), ("l2", 2, 1, False), ("l3", 0, 0, False)]
+    assert len(asked) == 5  # three of the five uv scenes, both pnpm ones
+    uv, pnpm = [p for p in asked if ":uv#" in p], [p for p in asked if ":pnpm#" in p]
+    assert all("- Use pnpm." in p and "- Start with Yes, chef." in p and "Use uv." not in p for p in uv)
+    assert all("- Use uv." in p and "Use pnpm." not in p for p in pnpm)
+
+
+def test_a_note_practised_in_two_conversations_keeps_one_for_its_test(store):
+    """A note can leave only when its lesson is followed on practice that was
+    not trained. One lesson in five held out left half the notes with nothing
+    to be asked on: they could never leave. A lesson practised in two
+    conversations keeps one out; a lesson from a single conversation keeps
+    three of its scenes out and trains on the rest."""
+    from songe import quick
+    from songe.practice.pool import (
+        EXTRA_HELD_OUT,
+        EXTRA_HELD_OUT_SCENES,
+        ensure_note_heldout,
+        held_out,
+    )
+
+    names = [f"s{i}" for i in range(40) if not held_out(f"s{i}")]
+    uv_a, uv_b, uv_c, pnpm, chef_a, chef_b = names[:6]
+    kept = next(f"h{i}" for i in range(40) if held_out(f"h{i}"))  # one in five is held out already
+
+    def scenes(signal, count):
+        with store.connect() as db:
+            for n in range(count):
+                row = {"id": f"{signal}#{n}", "signal_id": signal, "tools": [], "teacher_note": "Lesson",
+                       "messages": [{"role": "user", "content": f"request {signal} {n}"}]}
+                db.execute('INSERT INTO practice(id,model_id,signal_id,payload,kept,"drop",created)'
+                           " VALUES (?,?,?,?,1,NULL,0)", (row["id"], store.model_id, signal, json.dumps(row)))
+
+    for signal, count in ((uv_a, 6), (uv_b, 4), (uv_c, 5), (pnpm, 6), (chef_a, 6), (chef_b, 6), (kept, 6)):
+        scenes(signal, count)
+    store.set(quick.KEY, {"version": 1, "updated_at": None, "removed": [], "lessons": [
+        {"id": "l1", "text": "Use uv.", "signals": [uv_a, uv_b, uv_c]},
+        {"id": "l2", "text": "Use pnpm.", "signals": [pnpm]},          # one conversation: three scenes kept out
+        {"id": "l3", "text": "Start with Yes, chef.", "signals": [chef_a, chef_b, kept]},  # has a held-out one
+    ]})
+    store.set("trained_signals", [uv_b])  # an adopted version trained on it: never a test afterwards
+    assert ensure_note_heldout(store) == 4
+    assert store.get(EXTRA_HELD_OUT) == [uv_c]  # the fewest scenes among those never trained
+    assert store.get(EXTRA_HELD_OUT_SCENES) == [f"{pnpm}#3", f"{pnpm}#4", f"{pnpm}#5"]
+    held = practice_pool.practice_steps(store, split="held_out")
+    assert {s["signal_id"] for s in held} == {uv_c, kept, pnpm}
+    assert [s["id"] for s in held if s["signal_id"] == pnpm] == [f"practice:{pnpm}#{n}" for n in (3, 4, 5)]
+    train = practice_pool.practice_steps(store)
+    assert {s["signal_id"] for s in train} == {uv_a, uv_b, pnpm, chef_a, chef_b}
+    assert [s["id"] for s in train if s["signal_id"] == pnpm] == [f"practice:{pnpm}#{n}" for n in (0, 1, 2)]
+    assert ensure_note_heldout(store) == 0
+
+
+def test_a_learned_lesson_keeps_its_note_when_its_own_conversation_got_worse():
+    """Live (Qwen3.5-4B on a rented card, two Dreams): the pnpm lesson passed
+    the note test on its three held-out scenes, the note left, both pnpm
+    conversations were then judged worse, and the habit fell from 10 of 16
+    test requests to 2. A lesson is kept back when a conversation it came
+    from is among the moments the candidate, served without its note, lost."""
+    from songe.sleep import judged
+
+    lessons = [
+        {"id": "l1", "signals": ["uv-a", "uv-b"], "learned": True},
+        {"id": "l2", "signals": ["pnpm-a"], "learned": True},
+        {"id": "l3", "signals": ["chef-a"], "learned": False},
+    ]
+    session = {"uv-a": "c1", "uv-b": "c2", "pnpm-a": "c3", "chef-a": "c4"}
+    rows = [{"conversation": c, "outcome": o} for c, o in (("c1", "win"), ("c2", "tie"), ("c3", "loss"), ("c4", "loss"))]
+    assert judged.kept_back(lessons, rows, session) == {"l2"}  # l3 was not leaving anyway
+    assert judged.kept_back(lessons, [r | {"outcome": "tie"} for r in rows], session) == set()
+
+
+def test_each_version_answers_with_the_notes_it_is_served_with(monkeypatch):
+    """The gate's judged moments are answered as the user would get them:
+    with the lessons block in the system message, where the proxy puts it.
+    Answers written with different notes are different measurements."""
+    from songe.sleep import judged
+
+    seen = []
+    monkeypatch.setattr(judged, "paired_prompts", lambda tok, step, config: (step["context"], None))
+    monkeypatch.setattr(judged, "answer", lambda text, tok, tools: {"text": text, "tool_calls": [], "valid": True})
+
+    class Fake:
+        tokenizer = config = None
+
+        def sample(self, prompt, seed=None, *, deterministic=False, max_tokens=None):
+            seen.append(prompt)
+            return [], "ok", None
+
+    class Journal:
+        names = []
+
+        def unit(self, name, fn):
+            self.names.append(name)
+            return fn()
+
+    step = {"id": "s0", "conversation": "c", "source_id": 1, "observed_id": 0, "tools": [],
+            "context": [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Install zod"}]}
+    journal = Journal()
+    judged.answers(Fake(), journal, [step], "before", lambda: None, notes="Lessons:\n- Use pnpm.")
+    judged.answers(Fake(), journal, [step], "scale-1.0", lambda: None)
+    assert seen[0][0]["content"] == "Be brief.\n\nLessons:\n- Use pnpm." and seen[0][1:] == step["context"][1:]
+    assert seen[1] == step["context"]
+    assert journal.names[0] not in ("judged-before-s0", journal.names[1]) and journal.names[1] == "judged-scale-1.0-s0"
 
 
 def test_judged_units_decide_and_the_kl_is_only_a_diagnostic():
@@ -724,7 +905,7 @@ def test_judged_units_decide_and_the_kl_is_only_a_diagnostic():
     assert not d.accepted and d.reason.startswith("Not clearly better: better on 0, worse on 0")
 
 
-def test_near_identical_calls_tie_and_a_judge_that_always_picks_one_side_counts_for_nothing(monkeypatch):
+def test_near_identical_calls_tie_and_a_judge_that_says_yes_to_everything_counts_for_nothing(monkeypatch):
     """Live: two reads of snake.py (line 20 vs 21) and two "debate the
     timeout" answers were judged wins; a 3B judge preferred one position."""
     import contextlib
@@ -736,20 +917,36 @@ def test_near_identical_calls_tie_and_a_judge_that_always_picks_one_side_counts_
     assert not differs(read(20), read(21))
     monkeypatch.setattr(judged, "render", lambda tok, messages, tools, **kw: messages[0]["content"])
 
-    class AlwaysA:
+    class AlwaysYes:
         tokenizer = config = None
 
         def base(self):
             return contextlib.nullcontext()
 
         def sample(self, prompt, seed=None, *, deterministic=False, max_tokens=None):
-            return [], '{"follows": "A"}', None
+            return [], '{"follows": "yes"}', None
 
     step = {"id": "m1", "conversation": "c1", "context": [{"role": "user", "content": "run it"}],
             "hindsight": [{"role": "user", "content": "always execute the script"}]}
     before = {"text": "", "tool_calls": [{"name": "bash", "arguments": {"command": "python game.py"}}], "tokens": [1]}
     after = {"text": "", "tool_calls": [{"name": "edit", "arguments": {"path": "game.py"}}], "tokens": [2]}
-    assert judged.outcome(AlwaysA(), step, before, after) == ("tie", "both")
+    assert judged.outcome(AlwaysYes(), step, before, after) == ("tie", "both")
+    # User decision: only identical answers tie unasked; a near match goes to
+    # the judge (here: both follow, still a tie, but the judge said so).
+    assert judged.outcome(AlwaysYes(), step, read(20), read(21)) == ("tie", "both")
+
+
+def test_only_identical_answers_tie_without_the_judge():
+    from songe.quick import identical
+
+    bash = lambda command, **extra: {"text": "", "tool_calls": [{"name": "bash", "arguments": {"command": command, **extra}}]}  # noqa: E731
+    # Key order and whitespace are not the action.
+    assert identical({"text": "Running it.", "tool_calls": [{"name": "bash", "arguments": {"command": "ls", "cwd": "."}}]},
+                     {"text": "Running  it.", "tool_calls": [{"name": "bash", "arguments": {"cwd": ".", "command": "ls"}}]})
+    # One flag added is: far above any similarity threshold, still the judge's call.
+    assert not identical(bash('git commit -m "fix parser"'), bash('git commit --no-verify -m "fix parser"'))
+    # So is a reworded preamble before the same call.
+    assert not identical({"text": "Let me check.", "tool_calls": []}, {"text": "I'll look.", "tool_calls": []})
 
 
 def test_a_targeted_lesson_living_in_one_conversation_can_pass_per_moment():
@@ -771,9 +968,48 @@ def test_a_targeted_lesson_living_in_one_conversation_can_pass_per_moment():
     assert not decide(before, weak, min_heldout=5, drift_limit=0.05).accepted
 
 
+def test_two_answers_that_both_do_what_was_asked_tie_whatever_else_differs(monkeypatch):
+    """Live, Qwen3.5-4B as judge: "Yes, chef." and a fenced `pnpm add
+    react-query` against the bare command under "We're on pnpm here." was a
+    loss; a full sentence with the date against the bare date a loss for one
+    question and a win for the next. Asked which of two answers follows
+    better, the judge prefers one of them for reasons the feedback does not
+    name; asked about each alone, both do what was asked, and that is a tie."""
+    import contextlib
+
+    from songe.sleep import judged
+
+    monkeypatch.setattr(judged, "render", lambda tok, messages, tools, **kw: messages[0]["content"])
+    asked = []
+
+    class PrefersTheLonger:
+        tokenizer = config = None
+
+        def base(self):
+            return contextlib.nullcontext()
+
+        def sample(self, prompt, seed=None, *, deterministic=False, max_tokens=None):
+            asked.append(prompt)
+            if "Answer A:" in prompt:  # which of two: the longer one, in either order
+                a, b = prompt.split("Answer A:")[1].split("Answer B:")
+                return [], '{"follows": "%s"}' % ("A" if len(a) > len(b.split("Which answer")[0]) else "B"), None
+            return [], '{"follows": "%s"}' % ("yes" if "pnpm add" in prompt.split("answer now:")[1] else "no"), None
+
+    step = {"id": "m1", "conversation": "c1", "context": [{"role": "user", "content": "How do I add react-query to my web app?"}],
+            "hindsight": [{"role": "user", "content": "We're on pnpm here."}]}
+    before = {"text": "Yes, chef.\n\n```bash\npnpm add react-query\n```", "tool_calls": [], "tokens": [1]}
+    after = {"text": "pnpm add react-query", "tool_calls": [], "tokens": [2]}
+    old = {"text": "```bash\nnpm install react-query\n```\nThis installs the package and its types.", "tool_calls": [], "tokens": [3]}
+    assert judged.outcome(PrefersTheLonger(), step, before, after) == ("tie", "both")
+    assert all("Answer A:" not in prompt for prompt in asked)  # never asked to prefer one
+    # Only one of them does it: that one wins, however short it is.
+    assert judged.outcome(PrefersTheLonger(), step, old, after) == ("win", "judge")
+    assert judged.outcome(PrefersTheLonger(), step, after, old) == ("loss", "judge")
+
+
 def test_the_judge_s_answer_is_begun_for_it_with_thinking_switched_off(monkeypatch):
     """Live: about 4 of 14 replies could not be read. The reply is begun
-    ('{"follows": "'), so only the letter is left, and thinking is off."""
+    ('{"follows": "'), so only the word is left, and thinking is off."""
     import contextlib
 
     from songe.sleep import judged
@@ -1157,3 +1393,18 @@ def test_the_incumbents_measurements_are_kept_for_the_next_dream(tmp_path, confi
     evaluate(v, v, refs[:1], [], drift_refs=drift_refs,
              kept_as=KeptMeasurements(tmp_path, ["incumbent-b"]))
     assert len(calls) == 12 + 2 and len(list(tmp_path.iterdir())) == 1
+
+
+def test_the_judge_s_yes_or_no_is_read_after_a_preamble_and_not_from_a_longer_word():
+    """Where the tokenizer cannot take the begun reply the judge may write a
+    sentence or a thought before its JSON: still a verdict. "not sure" or
+    "nope" is neither a yes nor a no."""
+    from songe.sleep.judged import verdict
+
+    assert verdict('{"follows": "yes"}') is True
+    assert verdict('{"follows": "no"}') is False
+    assert verdict('Looking at it, the answer uses pnpm.\n{"follows": "yes"}') is True
+    assert verdict('<think>it still says npm</think>{"follows": "no"}') is False
+    assert verdict('{"follows": "not sure"}') is None
+    assert verdict('{"follows": "nope"}') is None
+    assert verdict("Let me think about the answer") is None

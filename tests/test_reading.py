@@ -39,9 +39,11 @@ def reply(message):
     return {"choices": [{"message": message}]}
 
 
-def record_session(store, *, more=False, started=None, reply_text="No, you changed the wrong file."):
+def record_session(store, *, more=False, started=None, reply_text="No, you changed the wrong file.",
+                   ask="fix the failing test"):
     """Ask, run the tests (1 failed), edit, run again (passed), done; then the
-    user corrects. With more=True the session continues one more turn."""
+    user corrects. With more=True the session continues one more turn. Another
+    `ask` makes another conversation (the same opening is the same one)."""
     t1 = {"role": "assistant", "content": "", "tool_calls": [call("a", "shell", command="pytest")]}
     r1 = {"role": "tool", "tool_call_id": "a", "content": "1 failed, 2 passed\nExit code: 1"}
     t2 = {"role": "assistant", "content": "", "tool_calls": [call("b", "edit", filePath="x.py", oldString="a", newString="b")]}
@@ -49,7 +51,7 @@ def record_session(store, *, more=False, started=None, reply_text="No, you chang
     t3 = {"role": "assistant", "content": "", "tool_calls": [call("c", "shell", command="pytest")]}
     r3 = {"role": "tool", "tool_call_id": "c", "content": "3 passed\nExit code: 0"}
     done = {"role": "assistant", "content": "Fixed."}
-    user = {"role": "user", "content": "fix the failing test"}
+    user = {"role": "user", "content": ask}
     history = [SYSTEM, user]
     for action, result in ((t1, r1), (t2, r2), (t3, r3)):
         store.record("/v1/chat/completions", {"messages": history, "tools": TOOLS}, reply(action), started=started)
@@ -155,11 +157,67 @@ def test_a_standing_wish_read_as_new_work_is_still_a_correction(store):
     assert wish["lesson"] == wish["short"] == "Answer in Russian." and wish["generality"] == "always"
 
 
-@pytest.mark.parametrize("kind", ["once", "task", "reaction"])
+@pytest.mark.parametrize("kind", ["task", "reaction"])
 def test_a_turn_that_is_no_standing_wish_adds_nothing(store, kind):
     record_session(store, reply_text="could you add a paragraph on costs?")
     read(store, Judging("no", kind))
     assert [s for s in reading.signals(store) if s["type"] == "correction"] == []
+
+
+def test_a_change_wanted_once_read_as_new_work_waits_for_a_second_conversation(store):
+    """Live (Qwen3.5-4B): the split called 'Say "Yes, chef." first.' new work,
+    the turn question a change wanted once, and nothing was stored. The same
+    wish in the next conversation then had nothing to meet, in any number of
+    conversations."""
+    from songe import quick
+
+    first, again = 'Say "Yes, chef." first.', 'Say "Yes, chef." first, please.'
+    record_chat(store, ("Give me one tip for staying focused.", "Turn off notifications."), (first, "Yes, chef. Turn off notifications."))
+    read(store, Judging("no", "once"))
+    waiting = [s for s in reading.signals(store) if s["type"] == "correction"]
+    # A correction, for the prompt only once the wish recurs.
+    assert [(s["text"], s["turn_kind"], bool(s["lesson"])) for s in waiting] == [(first, "once", True)]
+    assert quick.candidates(store, 30, 2) == []
+    record_chat(store, ("What is the capital of Australia?", "Canberra."), (again, "Yes, chef. Canberra."))
+    read(store, Judging("no", "once"))
+    assert [len(c["signals"]) for c in quick.candidates(store, 30, 2)] == [2]
+
+
+class Disagreeing(FakeReader):
+    """The split reads every turn as a correction (FakeReader); the turn
+    question reads new work."""
+
+    async def ask(self, prompt, schema, name):
+        answer = await super().ask(prompt, schema, name)
+        if name == "lesson" and "Yes, chef." in prompt:
+            # A lesson in the user's words, the same for both reminders.
+            return dict(answer, lesson='Start every reply with "Yes, chef."', short='Start every reply with "Yes, chef."')
+        return {"standing": "no", "kind": "task", "wish": ""} if name == "turn" else answer
+
+
+def test_a_reminder_read_as_a_question_waits_like_a_change_wanted_once(store):
+    """Live (Qwen3.5-4B): the split read 'Where's my "Yes, chef."?' as a part
+    that says something is missing, the turn question as a question (new
+    work). It was stored as new work, so it never met 'You forgot the "Yes,
+    chef."' from another conversation, and the habit never got a note."""
+    from songe import quick
+
+    record_chat(store, ("What is the capital of Australia?", "Canberra."), ('Where\'s my "Yes, chef."?', "Yes, chef. Canberra."))
+    read(store, Disagreeing())
+    reminder = next(s for s in reading.signals(store) if s["type"] == "correction")
+    assert reminder["turn_kind"] == "once" and quick.suitable(reminder)
+    assert quick.candidates(store, 30, 2) == []  # waits for a second conversation
+    record_chat(store, ("What's a good name for a cat?", "Whiskers."), ('You forgot the "Yes, chef."', "Yes, chef. Whiskers."))
+    read(store, Disagreeing())
+    assert [len(c["signals"]) for c in quick.candidates(store, 30, 2)] == [2]
+
+
+def test_after_work_with_tools_the_turn_question_decides_what_is_new_work(store):
+    # "The tests still fail" after edits and test runs: the split calls it a
+    # correction, the turn question new work. That stays new work.
+    record_session(store, reply_text="the tests still fail")
+    read(store, Disagreeing())
+    assert [s["turn_kind"] for s in reading.signals(store) if s["type"] == "correction"] == ["task"]
 
 
 def test_a_long_message_is_work_and_is_not_asked_about(store):
@@ -178,6 +236,167 @@ def test_an_example_of_the_question_pasted_back_is_not_the_users_wish():
     assert P.turn_verdict(pasted, "reply me in chinese") == ("lasting", "Answer in Chinese.")
     assert P.turn_verdict(pasted, "请用中文回答") == ("lasting", "Answer in Chinese.")
     assert P.turn_verdict({"standing": "yes", "kind": "once", "wish": "Use metric units."}, "everything in metric")[0] == "lasting"
+
+
+def test_a_wish_limited_to_now_is_not_a_standing_wish():
+    from songe.reading import prompts as P
+
+    # Live (Qwen3.8-27B): "today only reply fast" and "今天先别管 lint 了" were read as standing wishes.
+    fast = {"standing": "yes", "kind": "once", "wish": "Reply fast and short today."}
+    assert P.turn_verdict(fast, "today only reply fast, short short. deadline at 5") == ("task", "")
+    assert P.turn_verdict({"standing": "yes", "kind": "task", "wish": "Ignore lint today."}, "今天先别管 lint 了，下午 demo 要紧") == ("task", "")
+    assert P.turn_verdict({"standing": "yes", "kind": "once", "wish": "Use inline styles."}, "just this once inline styles are fine") == ("task", "")
+    assert P.turn_verdict({"standing": "yes", "kind": "once", "wish": "Answer in Chinese."}, "from today on answer in chinese") == ("lasting", "Answer in Chinese.")
+    assert P.turn_verdict({"standing": "yes", "kind": "once", "wish": "Answer in Chinese."}, "以后都用中文回答，今天开始") == ("lasting", "Answer in Chinese.")
+    assert P.turn_verdict({"standing": "yes", "kind": "once", "wish": "Put today's date at the top of every note."}, "put today's date at the top of every note")[0] == "lasting"
+    fy = {"standing": "yes", "kind": "once", "wish": "Start the fiscal year on February 1."}
+    assert P.turn_verdict(fy, "fiscal starts feb 1st!! FY27 ytd is from 2026-02-01 till today")[0] == "lasting"
+
+
+def test_a_lasting_wish_beside_a_mention_of_today_is_kept():
+    from songe.reading import prompts as P
+
+    # "Today" elsewhere in the message, or a wish said to last beyond today,
+    # does not make the wish a passing one.
+    tabs = {"standing": "yes", "kind": "task", "wish": "Use tabs, not spaces."}
+    assert P.turn_verdict(tabs, "I prefer tabs, not spaces. Today let us refactor utils.py")[0] == "lasting"
+    short = {"standing": "yes", "kind": "once", "wish": "Keep answers short."}
+    assert P.turn_verdict(short, "keep answers short, today and always")[0] == "lasting"
+    assert P.turn_verdict({"standing": "yes", "kind": "once", "wish": "Use no emojis."}, "no emojis ever, not just today")[0] == "lasting"
+    assert P.turn_verdict({"standing": "yes", "kind": "once", "wish": "Use tabs."}, "for now on use tabs")[0] == "lasting"
+    assert P.turn_verdict(short, "keep answers short today, deadline at 5") == ("task", "")
+
+
+def test_a_rule_sentence_carries_what_its_turn_was(store):
+    # The rules find "Always ..." in the user's message by its shape; the
+    # verdict on the turn it stands in goes with it (quick.suitable).
+    record_session(store, reply_text="Always keep the old entry point working.")
+    read(store, Judging("no", "task"))
+    rule = next(s for s in reading.signals(store) if s.get("from") == "rules" and s["source"] == "user")
+    assert (rule["text"], rule["turn_kind"]) == ("Always keep the old entry point working.", "task")
+
+
+def test_a_wish_that_says_nothing_the_user_wrote_is_not_used():
+    """Live (Qwen3.5-4B): the turn question returned the wish "Speak French."
+    for a user who wrote 'Always start your reply with "Yes, chef."'."""
+    from songe.reading import prompts as P
+
+    said, cat = 'Always start your reply with "Yes, chef."', "[U1] What's a good name for a cat?"
+    french = {"standing": "yes", "kind": "once", "wish": "Speak French."}
+    # The model's wording is dropped; the user's own message is the note.
+    assert P.turn_verdict(french, said, cat) == ("lasting", said)
+    # Several sentences (which one is the wish?), too long to stay whole as a
+    # note, or a single word: no wish from this question.
+    assert P.turn_verdict(french, "That was wrong. " + said, cat) == ("lasting", "")
+    assert P.turn_verdict(french, "start your reply with yes chef and " + "then go on " * 8, cat) == ("lasting", "")
+    assert P.turn_verdict(french, "again", cat) == ("lasting", "")
+    # Words that only point back at the conversation are left off the note.
+    assert P.own_words("Same thing without the comments.") == "Without the comments."
+    assert P.own_words("Same thing but no em dashes please.") == "No em dashes please."
+    assert P.own_words("Again, properly.") == ""
+    # A wish worded from the user's words stays as the model worded it,
+    # also when the user said it in an earlier message of the conversation.
+    chef = {"standing": "yes", "kind": "once", "wish": "Start every reply with 'Yes, chef.'"}
+    assert P.turn_verdict(chef, said, cat) == ("lasting", chef["wish"])
+    assert P.turn_verdict(chef, "Again, properly.", f"{cat}\n[U2] {said}") == ("lasting", chef["wish"])
+    # One word of an earlier message is not enough. Live: a page pasted
+    # earlier had a button in it, and a remark about quotation marks came
+    # back as the question's own example.
+    green = {"standing": "yes", "kind": "once", "wish": "Make the buttons green."}
+    quotes = "you output the wrong type of quotations"
+    assert P.turn_verdict(green, quotes, '[U1] <button class="buy">Buy</button>') == ("lasting", quotes)
+    russian = {"standing": "yes", "kind": "task", "wish": "Answer in Russian."}
+    assert P.turn_verdict(russian, "i want in russian") == ("lasting", "Answer in Russian.")
+    # One of the user's words is enough for a wish: this one is right.
+    imperial = {"standing": "yes", "kind": "task", "wish": "Use imperial units, not metric."}
+    assert P.turn_verdict(imperial, "why are you giving me answers in the metric system") == ("lasting", imperial["wish"])
+
+
+class Guessing(FakeReader):
+    """Judges every turn a change wanted once and writes the lesson given."""
+
+    def __init__(self, lesson, turn=None):
+        super().__init__()
+        self.lesson, self.turn = lesson, turn or {"standing": "no", "kind": "once", "wish": ""}
+
+    async def ask(self, prompt, schema, name):
+        answer = await super().ask(prompt, schema, name)
+        if name == "lesson":
+            return dict(answer, lesson=self.lesson, short=self.lesson, generality="always")
+        return self.turn if name == "turn" else answer
+
+
+def test_a_lesson_that_guesses_what_was_wrong_with_an_answer_is_no_lesson(store):
+    """Live (Qwen3.5-4B, a plain chat): "Just the code." was stored as the
+    lesson below, and a Deep Dream practised it."""
+    record_chat(store, ("Write a bash one-liner that counts the lines in every .py file here.", "Sure! Here it is: ..."),
+                ("Just the code.", "find . -name '*.py' | xargs wc -l"))
+    read(store, Guessing("Always include the exact file pattern requested by the user."))
+    guess = next(s for s in reading.signals(store) if s["type"] == "correction")
+    # The user wanted the answer changed: their own words are the lesson.
+    assert (guess["turn_kind"], guess["lesson"], guess["short"], guess["unvoiced"]) == ("once", "Just the code.", "Just the code.", True)
+
+
+@pytest.mark.parametrize("kind", ["task", "reaction"])
+def test_a_guess_about_a_turn_that_asked_for_no_change_is_no_lesson(store, kind):
+    record_chat(store, ("When was the first iPhone released?", "It was announced on January 9, 2007."),
+                ("And the first iPad?", "April 3, 2010."))
+    # The split finds feedback but nothing wrong in it, as for a follow-up
+    # question: the turn question's verdict stands (a part that says something
+    # is wrong after a plain answer would wait like a change wanted once).
+    reader = Guessing("Always use the public availability date, not the announcement date.", {"standing": "no", "kind": kind, "wish": ""})
+    ask = reader.ask
+
+    async def nothing_wrong(prompt, schema, name):
+        answer = await ask(prompt, schema, name)
+        if name == "classify":
+            answer = {"parts": [dict(p, says_something_is_wrong=False) for p in answer["parts"]]}
+        return answer
+
+    reader.ask = nothing_wrong
+    read(store, reader)
+    guess = next(s for s in reading.signals(store) if s["type"] == "correction")
+    assert (guess["lesson"], guess["short"], guess["unvoiced"]) == (None, None, True)
+    from songe.practice.store import lesson_signals
+    assert lesson_signals(store) == []  # nothing to practise
+
+
+def test_a_lesson_in_the_users_words_stays(store):
+    record_chat(store, ("Write a bash one-liner that counts the lines in every .py file here.", "Sure! Here it is: ..."),
+                ("Just the code.", "find . -name '*.py' | xargs wc -l"))
+    read(store, Guessing("Write just the code."))
+    kept = next(s for s in reading.signals(store) if s["type"] == "correction")
+    assert kept["lesson"] == kept["short"] == "Write just the code." and "unvoiced" not in kept
+
+
+def test_a_lesson_about_what_the_agent_did_need_not_be_in_the_users_words(store):
+    # After tool calls the lesson is about the agent's steps: "No, you changed
+    # the wrong file." says nothing of tests, and the advice stays.
+    record_session(store)
+    read(store, Guessing("Check which file the failing test covers before editing."))
+    advice = next(s for s in reading.signals(store) if s["type"] == "correction")
+    assert advice["lesson"].startswith("Check which file") and "unvoiced" not in advice
+
+
+def test_a_wish_the_model_invented_is_stored_in_the_users_own_words(store):
+    said = 'Always start your reply with "Yes, chef."'
+    record_chat(store, ("What's a good name for a cat?", "Whiskers."), (said, "Yes, chef. Whiskers."))
+    read(store, Guessing("Always confirm the direct answer first.", {"standing": "yes", "kind": "once", "wish": "Speak French."}))
+    wish = next(s for s in reading.signals(store) if s["type"] == "correction")
+    assert wish["turn_kind"] == "lasting" and wish["lesson"] == wish["short"] == said
+
+
+def test_voiced_is_the_share_of_content_words_the_user_wrote():
+    from songe.reading.rules import voiced
+
+    assert voiced("Answer in Russian.", "i want in russian") == 1
+    assert voiced("Do not apologize.", "can you stop apologizing all the time") == 1  # endings ignored
+    assert voiced("Use Polars, not pandas.", "no pandas, polars only") == 1
+    assert voiced("Speak French.", 'Always start your reply with "Yes, chef."') == 0
+    assert voiced("Always use the public availability date, not the announcement date.", "Date as 2007-06-29 please.") == 0.25
+    assert voiced("Always include the requested phrase exactly as the user named it.", "You forgot the 'Yes, chef.'") == 0
+    assert voiced("Answer in Chinese.", "请用中文回答") == 1  # words cannot show it
+    assert voiced("Answer.", "restart the duel") == 1  # no content word to compare
 
 
 def test_words_the_user_put_in_quotation_marks_are_not_cut_off(store):
@@ -327,6 +546,180 @@ def test_the_client_falls_back_when_structured_output_is_refused(store):
     assert reader.cached == 1
 
 
+def test_the_client_stays_structured_after_a_single_off_schema_200(store, caplog):
+    """An enforcing server (vLLM, llama.cpp, LM Studio, Ollama) that returns
+    one off-schema 200 answer gets that single question retried plainly, while
+    structured output stays on and resets after a conforming answer."""
+    import logging
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "steps": {"type": "array", "items": {"type": "integer"}},
+            "reason": {"type": "string"},
+        },
+        "required": ["steps", "reason"],
+    }
+    bodies = []
+    structured_calls = 0
+
+    def server(request):
+        nonlocal structured_calls
+        body = json.loads(request.content)
+        bodies.append(body)
+        if "response_format" in body:
+            structured_calls += 1
+            # 1st and 3rd structured calls return off-schema 200; 2nd conforms and resets counter.
+            if structured_calls in (1, 3):
+                return httpx.Response(
+                    200,
+                    json={
+                        "choices": [{"finish_reason": "stop", "message": {"content": ""}}],
+                        "usage": {"completion_tokens": 5},
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"finish_reason": "stop", "message": {"content": '{"steps": [1], "reason": "ok"}'}}
+                    ],
+                    "usage": {"completion_tokens": 10},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"finish_reason": "stop", "message": {"content": '{"steps": [2], "reason": "retried"}'}}
+                ],
+                "usage": {"completion_tokens": 15},
+            },
+        )
+
+    reader = Reader(
+        store,
+        "http://x/v1",
+        "m-vllm",
+        server="vllm",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(server)),
+    )
+
+    async def run():
+        a = await reader.ask("q1", schema, "responsible")
+        b = await reader.ask("q2", schema, "responsible")
+        c = await reader.ask("q3", schema, "responsible")
+        return a, b, c
+
+    with caplog.at_level(logging.INFO, logger="songe.reading.client"):
+        a, b, c = asyncio.run(run())
+    assert a == c == {"steps": [2], "reason": "retried"}
+    assert b == {"steps": [1], "reason": "ok"}
+    assert reader.structured is True
+    assert getattr(reader, "errors", 0) == 0
+    assert not any("reader_no_structured" in r.getMessage() for r in caplog.records)
+    # q1: structured (off-schema) + plain retry; q2: structured (ok, resets); q3: structured (off-schema) + plain retry.
+    assert [bool("response_format" in b) for b in bodies] == [True, False, True, True, False]
+    assert reader.tokens_out == 5 + 15 + 10 + 5 + 15
+
+
+@pytest.mark.parametrize(
+    "ignored_content",
+    [
+        "Step 2 caused the error.",
+        json.dumps({"steps": ["not-an-int"], "reason": "wrong type"}),
+    ],
+)
+def test_the_client_switches_to_plain_after_two_off_schema_200s(store, caplog, ignored_content):
+    """A server that ignores response_format with 200 twice in a row switches
+    to plain schema-in-prompt mode, logs once, and stays plain afterwards."""
+    import logging
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "steps": {"type": "array", "items": {"type": "integer"}},
+            "reason": {"type": "string"},
+        },
+        "required": ["steps", "reason"],
+    }
+    bodies = []
+
+    def server(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        if "response_format" in body:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [{"finish_reason": "stop", "message": {"content": ignored_content}}],
+                    "usage": {"completion_tokens": 12},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"finish_reason": "stop", "message": {"content": '{"steps": [2], "reason": "ok"}'}}
+                ],
+                "usage": {"completion_tokens": 15},
+            },
+        )
+
+    reader = Reader(
+        store,
+        "http://x/v1",
+        f"m-{len(ignored_content)}",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(server)),
+    )
+
+    async def run():
+        a = await reader.ask("q1", schema, "responsible")
+        b = await reader.ask("q2", schema, "responsible")
+        c = await reader.ask("q3", schema, "responsible")
+        return a, b, c
+
+    with caplog.at_level(logging.INFO, logger="songe.reading.client"):
+        a, b, c = asyncio.run(run())
+    assert a == b == c == {"steps": [2], "reason": "ok"}
+    assert reader.structured is False
+    assert getattr(reader, "errors", 0) == 0
+    # q1: structured + plain; q2: structured (2nd miss -> switch) + plain; q3: plain directly.
+    assert [bool("response_format" in x) for x in bodies] == [True, False, True, False, False]
+    assert "The JSON must match this schema:" in bodies[1]["messages"][0]["content"]
+    assert "The JSON must match this schema:" in bodies[4]["messages"][0]["content"]
+    switch_logs = [r.getMessage() for r in caplog.records if "reader_no_structured" in r.getMessage()]
+    assert len(switch_logs) == 1
+    assert reader.tokens_out == 12 + 15 + 12 + 15 + 15
+
+
+def test_mlx_reader_starts_in_plain_mode(store):
+    """Live (mlx_lm.server 0.32.2): mlx-lm ignores response_format with 200, so
+    Reader(server='mlx') starts in plain schema-in-prompt mode."""
+    bodies = []
+
+    def server(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        return httpx.Response(
+            200,
+            json={"choices": [{"finish_reason": "stop", "message": {"content": '{"steps": [1], "reason": "r"}'}}]},
+        )
+
+    reader = Reader(
+        store,
+        "http://x/v1",
+        "m-mlx",
+        server="mlx",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(server)),
+    )
+    assert reader.structured is False
+    ans = asyncio.run(reader.ask("q", {"type": "object"}, "responsible"))
+    assert ans == {"steps": [1], "reason": "r"}
+    assert len(bodies) == 1 and "response_format" not in bodies[0]
+    assert "The JSON must match this schema:" in bodies[0]["messages"][0]["content"]
+
+
 def test_the_client_asks_for_a_plain_reply_the_way_a_user_does(store):
     """reply(): the served model's next message in a conversation, with no
     schema and none of the reasoning switches the reader's questions set."""
@@ -368,10 +761,10 @@ def test_the_client_stops_when_the_user_returns(store):
 ANSWERS = {
     "classify": {"parts": [{"says_something_is_wrong": True, "kind": "feedback",
                             "type": "correction", "text": "No, you changed the wrong file."}]},
-    "turn": {"standing": "no", "kind": "once"},
+    "turn": {"standing": "yes", "kind": "once", "wish": ""},
     "responsible": {"steps": [2], "reason": "wrong file"},
-    "lesson": {"lesson": "Check the file first.", "instance": "x.py", "generality": "kind",
-               "verifiable": None},
+    "lesson": {"lesson": "Check the file first.", "short": "Check the file first.",
+               "instance": "x.py", "generality": "kind", "verifiable": None},
     "review": {"signals": []},
     "dream": None,  # filled below
     "matters": {"why": "it is about this file", "answer": "A"},
@@ -433,7 +826,10 @@ async def test_idle_reading_uses_the_learners_own_loaded_model(config, store, mo
     registry.migrate(config, store)
     registry.observe(config, store, "learner")
     registry.set_learning(store, "learner", "all")
+    # The correction in two conversations: wanted once, it is a lesson to
+    # practise only when it comes up again.
     record_session(store)
+    record_session(store, ask="fix the other failing test")
     learner = store.scoped("learner")
     scheduler, asked = scheduler_for(config, store, monkeypatch, loaded=["someone-else"])
     assert await scheduler.read_sessions() == 0  # its own model is not loaded
@@ -442,14 +838,40 @@ async def test_idle_reading_uses_the_learners_own_loaded_model(config, store, mo
     from songe.practice import store as practice
 
     # Short pauses only read; practice is Deep Dream's first step.
-    assert await scheduler.read_sessions() == 1
+    assert await scheduler.read_sessions() == 2
     assert practice.counts(learner)["written"] == 0
-    # Deep: 3 scenes for its one lesson (the correction).
+    # Deep: 3 scenes for its one lesson (the correction, said twice).
     assert await scheduler.read_sessions(practice=True) == 3
     assert {model for model, _ in asked} == {"learner"}
     assert {s["type"] for s in reading.signals(learner)} == {"correction", "success"}
     assert reading.pending(learner) == []
     assert practice.counts(learner)["written"] == 3
+
+
+async def test_a_deep_dreams_reading_writes_the_notes_before_practice(config, store, monkeypatch):
+    """Only a Quick Dream wrote the prompt lessons. A Deep Dream that read
+    conversations no Quick Dream had read (pressed early, or a backlog) wrote
+    practice and trained, and its version was checked against a prompt that
+    did not hold those lessons yet (live: 8 notes for four of eight habits;
+    the rest arrived with the next Quick Dream, after the gate)."""
+    from songe import quick
+
+    config.learning = "dreams"
+    registry.migrate(config, store)
+    registry.observe(config, store, "learner")
+    registry.set_learning(store, "learner", "all")
+    # The same correction in two conversations: a lesson for the prompt.
+    record_session(store, ask="fix the other failing test")
+    record_session(store)
+    learner = store.scoped("learner")
+    scheduler, _ = scheduler_for(config, store, monkeypatch, loaded=["learner"])
+    assert quick.active(learner) == []
+    assert await scheduler.read_sessions(practice=True) > 2  # two conversations read, scenes written
+    assert [lesson["text"] for lesson in quick.active(learner)] == ["Check the file first."]
+    # Nothing new was read since: the lessons stand, no second entry.
+    history = len(learner.get(quick.HISTORY) or [])
+    await scheduler.read_sessions(practice=True, force=True)
+    assert len(learner.get(quick.HISTORY) or []) == history
 
 
 async def test_idle_reading_is_off_under_hindsight_learning(config, store, monkeypatch):
@@ -536,6 +958,427 @@ async def test_quick_dream_reads_then_puts_the_lessons_in_the_prompt(config, sto
     assert learner.get("quick_checked")["nothing_new"] is True
     from songe.wording import quick_message
     assert quick_message(None, nothing_since=learner.get("quick_last")["at"]).startswith("Nothing new since your last Quick Dream at ")
+
+
+async def test_quick_dream_under_memory_pressure_says_so_instead_of_started(config, store, monkeypatch):
+    """Reported by Jack in a test on 11-24: on a Mac at memory pressure
+    "warning", pressing Quick Dream said "Quick Dream started" and reading
+    returned at once with nothing read, and the page never said why."""
+    from pathlib import Path
+
+    from songe import quick
+
+    config.learning = "dreams"
+    registry.migrate(config, store)
+    registry.observe(config, store, "learner")
+    registry.set_learning(store, "learner", "all")
+    record_session(store)
+    learner = store.scoped("learner")
+    scheduler, asked = scheduler_for(config, store, monkeypatch, loaded=["learner"])
+    scheduler.platform.memory().pressure = "warning"
+    assert await scheduler.quick_now("learner") == "memory"
+    assert getattr(scheduler, "dream_task", None) is None and asked == []
+    assert learner.get("quick_checked")["error"] == "memory"
+    assert (learner.get(quick.HISTORY) or [])[-1]["error"] == "memory"
+    words = json.loads((Path(quick.__file__).parent / "ui" / "wording.json").read_text(encoding="utf-8"))
+    assert "memory" in words["quick_failed"] and "memory" in words["quick_failed_card"]
+    # Once memory is back to normal the same press reads.
+    scheduler.platform.memory().pressure = "normal"
+    assert await scheduler.quick_now("learner") == 1
+
+
+async def test_quick_dream_with_only_new_signals_under_memory_pressure_says_so(config, store, monkeypatch):
+    """Nothing unread, but signals since the last Quick Dream: the press would
+    publish lessons, and reading waits under memory pressure all the same."""
+    config.learning = "dreams"
+    registry.migrate(config, store)
+    registry.observe(config, store, "learner")
+    registry.set_learning(store, "learner", "all")
+    learner = store.scoped("learner")
+    learner.set("quick_seen", [999, 999])  # differs from what is there now
+    scheduler, asked = scheduler_for(config, store, monkeypatch, loaded=["learner"])
+    scheduler.platform.memory().pressure = "warn"
+    assert await scheduler.quick_now("learner") == "memory"
+    assert getattr(scheduler, "dream_task", None) is None and asked == []
+    assert learner.get("quick_checked")["error"] == "memory"
+
+
+def pressed_setup(config, store, monkeypatch, tmp_path, upstream, *, available=90_000, ollama=None):
+    """A learner with one unread conversation and a base version, a scheduler
+    on `upstream`, the reader's answers faked; `ollama` answers /api/*."""
+    from types import SimpleNamespace
+
+    from songe import schedule
+    from songe.platform import Memory
+    from songe.upstream import protection
+
+    config.learning = "dreams"
+    registry.migrate(config, store)
+    registry.observe(config, store, "learner")
+    registry.set_learning(store, "learner", "all")
+    record_session(store)
+    learner = store.scoped("learner")
+    learner.add_version({"id": "base-learner", "identifier": "learner", "artifact": str(tmp_path / "model"),
+                         "adapter": None, "created": 0, "night": 0, "kind": "gguf-full"})
+    learner.swap("base-learner", None)
+    asked = []
+
+    def route(request):
+        if request.url.path.startswith("/api/"):
+            return ollama(request)
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": []})
+        body = json.loads(request.content)
+        name = (body.get("response_format") or {}).get("json_schema", {}).get("name")
+        asked.append((body["model"], name))
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(ANSWERS.get(name, {}))}}]})
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **k: REAL_CLIENT(**(k | {"transport": httpx.MockTransport(route)})))
+    memory = SimpleNamespace(
+        name="test", memory=lambda: Memory(100_000, available), accelerators=lambda: [],
+        on_ac_power=lambda: True, idle_seconds=lambda: None, thermal=lambda: None,
+        process_bytes=lambda pid: 100,
+    )
+    monkeypatch.setattr(protection, "current", lambda: memory)
+    pressure = SimpleNamespace(pressure="normal")
+    scheduler = schedule.ModelScheduler(config, store, upstream, platform=SimpleNamespace(memory=lambda: pressure))
+    return scheduler, learner, asked
+
+
+def fake_ollama(tmp_path, running, hooks=None):
+    """Ollama's API as Songe uses it: /api/ps lists what is in memory, an
+    empty /api/generate loads (keep_alive 0 unloads). hooks: async callables
+    run on a "show" or "generate" request; "keep" in hooks keeps a model
+    listed after keep_alive 0 (the agent's request loaded it again)."""
+    import hashlib
+    from types import SimpleNamespace
+
+    from songe.upstream.ollama import Ollama
+
+    hooks = {} if hooks is None else hooks
+    (tmp_path / "model").write_bytes(b"gguf weights")
+    digest = hashlib.sha256(b"gguf weights").hexdigest()
+    generated = []
+
+    async def handler(request):
+        if request.url.path == "/api/ps":
+            return httpx.Response(200, json={"models": [{"name": n, "model": n} for n in running]})
+        if request.url.path == "/api/show":
+            if "show" in hooks:
+                await hooks["show"]()
+            return httpx.Response(200, json={"modelfile": f"FROM /blobs/sha256-{digest}"})
+        if request.url.path == "/api/generate":
+            body = json.loads(request.content)
+            generated.append(body)
+            if "generate" in hooks:
+                await hooks["generate"](body)
+            if body.get("keep_alive") == 0:
+                if "keep" not in hooks:
+                    running[:] = [n for n in running if n != body["model"] + ":latest"]
+            elif body["model"] + ":latest" not in running:
+                running.append(body["model"] + ":latest")
+            return httpx.Response(200, json={"done": True})
+        return httpx.Response(404)
+
+    upstream = Ollama(SimpleNamespace(upstream_url="http://ollama.test/v1", upstream_timeout=5,
+                                      guard_min_interval=0.01, guard_grace_seconds=1))
+    return upstream, handler, generated
+
+
+async def settle(scheduler):
+    """The pressed Quick Dream and its release (its own task) are done."""
+    if getattr(scheduler, "dream_task", None):
+        await scheduler.dream_task
+    await asyncio.gather(*scheduler.release_tasks.values())
+
+
+async def test_a_pressed_quick_dream_loads_the_ollama_model_and_releases_it(config, store, monkeypatch, tmp_path):
+    """Background reading never loads a model; a pressed Quick Dream loads the
+    learner's model with Ollama's own load and releases it once it is done."""
+    running = []
+    upstream, handler, generated = fake_ollama(tmp_path, running)
+    scheduler, learner, asked = pressed_setup(config, store, monkeypatch, tmp_path, upstream, ollama=handler)
+    assert await scheduler.read_sessions() == 0  # background: waits, loads nothing
+    assert generated == [] and asked == []
+    assert await scheduler.quick_now("learner") == 1
+    # Loaded with Ollama's empty-prompt warm, no keep_alive of Songe's own.
+    assert generated[0] == {"model": "learner", "prompt": "", "stream": False}
+    await settle(scheduler)
+    assert ("learner", "classify") in asked  # it read with the learner's model
+    # Released after this Quick Dream, confirmed gone from /api/ps.
+    assert generated[-1]["keep_alive"] == 0 and running == []
+    assert scheduler.press_loads == {} and upstream.owned == {}
+
+
+async def test_a_pressed_quick_dream_never_releases_the_users_ollama_model(config, store, monkeypatch, tmp_path):
+    running = ["learner:latest"]  # the user loaded it
+    upstream, handler, generated = fake_ollama(tmp_path, running)
+    scheduler, learner, asked = pressed_setup(config, store, monkeypatch, tmp_path, upstream, ollama=handler)
+    assert await scheduler.quick_now("learner") == 1
+    await settle(scheduler)
+    assert ("learner", "classify") in asked
+    assert generated == [] and running == ["learner:latest"]
+    # Even a load request reuses the user's instance and never claims it.
+    assert await scheduler.load_for_press("learner") is None
+    assert scheduler.press_loads == {}
+    await scheduler.release_press_load("learner")
+    assert generated == [] and running == ["learner:latest"]
+
+
+async def test_a_model_the_agent_asked_for_is_left_to_the_server(config, store, monkeypatch, tmp_path):
+    """Loaded for a press, then the agent asked for it (and then for another
+    model): it is the user's now, and Ollama's own keep-alive decides."""
+    running = []
+    upstream, handler, generated = fake_ollama(tmp_path, running)
+    scheduler, learner, asked = pressed_setup(config, store, monkeypatch, tmp_path, upstream, ollama=handler)
+    assert await scheduler.load_for_press("learner") is None and running == ["learner:latest"]
+    scheduler.traffic()
+    await scheduler.ensure_model("learner", learner.version())
+    scheduler.traffic()
+    scheduler.serving_model = "other"  # the agent moved on to another model
+    await scheduler.release_press_load("learner")
+    assert running == ["learner:latest"] and all("keep_alive" not in g for g in generated)
+
+
+async def test_traffic_to_another_model_does_not_keep_a_press_load(config, store, monkeypatch, tmp_path):
+    """The agent last served this model before the press, and since then only
+    another one: the press's load is still Songe's and is released."""
+    running = []
+    upstream, handler, generated = fake_ollama(tmp_path, running)
+    scheduler, learner, asked = pressed_setup(config, store, monkeypatch, tmp_path, upstream, ollama=handler)
+    scheduler.serving_model = "learner"
+    assert await scheduler.load_for_press("learner") is None
+    scheduler.traffic()  # a request for another model
+    await scheduler.release_press_load("learner")
+    assert running == [] and generated[-1]["keep_alive"] == 0
+
+
+async def test_a_release_waits_for_requests_and_readers_and_is_never_dropped(config, store, monkeypatch, tmp_path):
+    running = []
+    upstream, handler, generated = fake_ollama(tmp_path, running)
+    scheduler, learner, asked = pressed_setup(config, store, monkeypatch, tmp_path, upstream, ollama=handler)
+    assert await scheduler.load_for_press("learner") is None
+    scheduler.acquire("admission")  # a request (for any model) in flight
+    scheduler.reading_activity = {"learner": {}}  # and a reader on it
+    release = asyncio.create_task(scheduler.release_press_load("learner"))
+    await asyncio.sleep(0.05)
+    assert running == ["learner:latest"] and "learner" in scheduler.press_loads
+    scheduler.release("admission")
+    await asyncio.sleep(0.05)
+    assert running == ["learner:latest"]  # the reader still reads
+    scheduler.reading_activity = {}
+    await asyncio.wait_for(release, 2)
+    assert running == [] and scheduler.press_loads == {}
+
+
+async def test_background_reading_never_starts_on_a_model_loaded_for_a_press(config, store, monkeypatch, tmp_path):
+    running = []
+    upstream, handler, generated = fake_ollama(tmp_path, running)
+    scheduler, learner, asked = pressed_setup(config, store, monkeypatch, tmp_path, upstream, ollama=handler)
+    assert await scheduler.load_for_press("learner") is None and running == ["learner:latest"]
+    assert await scheduler.read_sessions() == 0 and asked == []
+    assert await scheduler.reader_for("learner") is None
+    assert scheduler.reading_busy()  # learning waits for the press too
+
+
+async def test_a_press_loads_without_holding_the_agents_lock(config, store, monkeypatch, tmp_path):
+    running, loading, go = [], asyncio.Event(), asyncio.Event()
+
+    async def slow(body):
+        loading.set()
+        await go.wait()
+
+    upstream, handler, generated = fake_ollama(tmp_path, running, {"generate": slow})
+    scheduler, learner, asked = pressed_setup(config, store, monkeypatch, tmp_path, upstream, ollama=handler)
+    press = asyncio.create_task(scheduler.quick_now("learner"))
+    try:
+        await asyncio.wait_for(loading.wait(), 2)
+        assert not scheduler.lock.locked()
+        # A second press while the first loads continues it: no second load.
+        assert await asyncio.wait_for(scheduler.quick_now("learner"), 1) is None
+    finally:
+        go.set()
+    assert await press == 1
+    await settle(scheduler)
+    assert [g.get("keep_alive") for g in generated] == [None, 0]
+
+
+async def test_a_request_admitted_during_the_release_keeps_the_model(config, store, monkeypatch, tmp_path):
+    """A request admitted while Songe releases stops the release with Songe's
+    claim kept: one for another model sends it back to wait and release
+    later; one for this model leaves the model to the agent."""
+    running = []
+    hooks = {}
+    upstream, handler, generated = fake_ollama(tmp_path, running, hooks)
+    scheduler, learner, asked = pressed_setup(config, store, monkeypatch, tmp_path, upstream, ollama=handler)
+    assert await scheduler.load_for_press("learner") is None
+
+    async def admitted():
+        hooks.pop("show")
+        scheduler.acquire("admission")  # a request for another model
+
+    hooks["show"] = admitted  # same_weights, just before the unload
+    release = asyncio.create_task(scheduler.release_press_load("learner"))
+    await asyncio.sleep(0.05)
+    assert running == ["learner:latest"] and all("keep_alive" not in g for g in generated)
+    assert "learner" in upstream.owned and "learner" in scheduler.press_loads
+    scheduler.release("admission")  # it finished: the release goes on
+    await asyncio.wait_for(release, 2)
+    assert running == [] and generated[-1]["keep_alive"] == 0 and upstream.owned == {}
+    # Admitted after keep_alive 0 was sent, for this model: Ollama loads it
+    # again for the agent, and the release stops waiting for /api/ps at once.
+    assert await scheduler.load_for_press("learner") is None
+
+    async def agent_back(body):
+        if body.get("keep_alive") == 0:
+            scheduler.acquire("admission")
+
+    hooks.update({"generate": agent_back, "keep": True})
+    started = asyncio.get_running_loop().time()
+    release = asyncio.create_task(scheduler.release_press_load("learner"))
+    await asyncio.sleep(0.05)
+    await scheduler.ensure_model("learner", learner.version())  # the agent's request
+    scheduler.release("admission")
+    await asyncio.wait_for(release, 2)
+    assert asyncio.get_running_loop().time() - started < 2
+    assert running == ["learner:latest"] and scheduler.press_loads == {}
+    assert "learner" in upstream.owned  # Songe's claim is never just dropped
+
+
+async def test_the_agent_waits_for_a_press_load_instead_of_loading_again(config, store, monkeypatch, tmp_path):
+    """LM Studio: a request for the model while a press loads it used to drop
+    the press's pending claim and load a second instance beside it."""
+    from tests.test_lmstudio import FakeLMS
+
+    upstream = FakeLMS(tmp_path, appear_after=1)
+    upstream.config.upstream_url = "http://lms.test/v1"
+    scheduler, learner, asked = pressed_setup(config, store, monkeypatch, tmp_path, upstream)
+    folder = tmp_path / "lmstudio-community/granite-4.2-3b-MLX-4bit"
+    folder.mkdir(parents=True)
+    (folder / "model.safetensors").write_bytes(b"mlx weights")
+    with store.connect() as db:
+        db.execute("UPDATE versions SET artifact=? WHERE id='base-learner'", (str(folder),))
+    loading, go = asyncio.Event(), asyncio.Event()
+    request_load = upstream.request_load
+
+    async def slow(key, identifier, context=None):
+        loading.set()
+        await go.wait()
+        await request_load(key, identifier, context)
+
+    upstream.request_load = slow
+    press = asyncio.create_task(scheduler.load_for_press("learner"))
+    try:
+        await asyncio.wait_for(loading.wait(), 2)
+        agent = asyncio.create_task(scheduler.ensure_model("learner", learner.version()))
+        await asyncio.sleep(0.05)
+        assert not agent.done()  # it waits for the press's load
+    finally:
+        go.set()
+    assert await press is None
+    await asyncio.wait_for(agent, 2)
+    assert [c[0] for c in upstream.calls if c[0] == "load"] == ["load"]
+    assert [m["identifier"] for m in upstream.ps] == ["learner"]
+    await scheduler.release_press_load("learner")  # the agent's now: kept
+    assert len(upstream.ps) == 1 and scheduler.press_loads == {}
+
+
+async def test_a_press_that_fails_after_loading_releases_the_model(config, store, monkeypatch, tmp_path):
+    running = []
+    upstream, handler, generated = fake_ollama(tmp_path, running)
+    scheduler, learner, asked = pressed_setup(config, store, monkeypatch, tmp_path, upstream, ollama=handler)
+    probes = []
+
+    async def reader_for(model):
+        probes.append(model)
+        if len(probes) > 1:
+            raise RuntimeError("the reader could not start")
+        return None
+
+    monkeypatch.setattr(scheduler, "reader_for", reader_for)
+    with pytest.raises(RuntimeError):
+        await scheduler.quick_now("learner")
+    await settle(scheduler)
+    assert generated[-1]["keep_alive"] == 0 and running == []
+    assert scheduler.press_loads == {} and not scheduler.pressing
+
+
+async def test_a_pressed_quick_dream_without_the_memory_waits_and_says_why(config, store, monkeypatch, tmp_path):
+    from songe import quick
+
+    running = []
+    upstream, handler, generated = fake_ollama(tmp_path, running)
+    scheduler, learner, asked = pressed_setup(
+        config, store, monkeypatch, tmp_path, upstream, available=0, ollama=handler)
+    answer = await scheduler.dream("learner", "quick")
+    assert not answer["started"] and "not enough free memory to load the model" in answer["message"]
+    assert generated == [] and running == [] and asked == []
+    assert getattr(scheduler, "dream_task", None) is None
+    assert learner.get("quick_checked")["error"] == "load_memory"
+    assert (learner.get(quick.HISTORY) or [])[-1]["error"] == "load_memory"
+
+
+async def test_a_model_of_unknown_size_is_not_loaded_for_a_press(config, store, monkeypatch, tmp_path):
+    """Admission sizes a load by its weights: weights Songe cannot read (an
+    Ollama blob outside its view) would pass as 0 bytes."""
+    running = []
+    upstream, handler, generated = fake_ollama(tmp_path, running)
+    scheduler, learner, asked = pressed_setup(config, store, monkeypatch, tmp_path, upstream, ollama=handler)
+    (tmp_path / "model").unlink()
+    answer = await scheduler.dream("learner", "quick")
+    assert not answer["started"] and "can't measure the model" in answer["message"]
+    assert generated == [] and running == [] and scheduler.press_loads == {}
+    assert learner.get("quick_checked")["error"] == "load_unknown"
+
+
+async def test_a_pressed_quick_dream_loads_and_releases_on_lm_studio(config, store, monkeypatch, tmp_path):
+    from tests.test_lmstudio import FakeLMS
+
+    upstream = FakeLMS(tmp_path, appear_after=1)
+    scheduler, learner, asked = pressed_setup(config, store, monkeypatch, tmp_path, upstream)
+    folder = tmp_path / "lmstudio-community/granite-4.2-3b-MLX-4bit"
+    folder.mkdir(parents=True)
+    (folder / "model.safetensors").write_bytes(b"mlx weights")
+    with store.connect() as db:  # LM Studio's own copy of the model
+        db.execute("UPDATE versions SET artifact=? WHERE id='base-learner'", (str(folder),))
+    assert await scheduler.read_sessions() == 0  # background: waits, loads nothing
+    assert upstream.calls == [] and asked == []
+    assert await scheduler.quick_now("learner") == 1
+    assert [c[0] for c in upstream.calls if c[0] in {"load", "unload"}] == ["load"]
+    await settle(scheduler)
+    assert ("learner", "classify") in asked
+    assert [c[0] for c in upstream.calls if c[0] in {"load", "unload"}] == ["load", "unload"]
+    assert upstream.ps == []
+    # A request admitted just before the unload keeps the model loaded.
+    assert await scheduler.load_for_press("learner") is None
+    live_owned = upstream.live_owned
+
+    async def admitted():
+        scheduler.acquire("admission")
+        return await live_owned()
+
+    upstream.live_owned = admitted
+    upstream.calls.clear()
+    upstream.ps[0]["contextLength"] = 32768  # Songe's choice, not the user's
+    release = asyncio.create_task(scheduler.release_press_load("learner"))
+    await asyncio.sleep(0.05)
+    upstream.live_owned = live_owned
+    assert not any(c[0] == "unload" for c in upstream.calls) and len(upstream.ps) == 1
+    # The claim stays Songe's: its context is not taken for the user's.
+    await upstream.served_contexts()
+    assert "learner" in upstream.owned and "learner" not in upstream.user_contexts
+    scheduler.release("admission")  # that request (another model's) is done
+    await asyncio.wait_for(release, 2)
+    assert upstream.ps == [] and scheduler.press_loads == {}
+    # A model the user loaded in LM Studio is read with and never unloaded.
+    record_session(store, ask="fix the other failing test")
+    upstream.ps.append({"identifier": "learner", "path": "lmstudio-community/granite-4.2-3b-MLX-4bit",
+                        "instanceReference": "users"})
+    upstream.calls.clear()
+    assert await scheduler.quick_now("learner") == 1
+    await settle(scheduler)
+    assert not any(c[0] in {"load", "unload"} for c in upstream.calls)
+    assert [m["identifier"] for m in upstream.ps] == ["learner"]
 
 
 def test_a_pi_compaction_is_not_a_conversation_and_its_continuation_joins(store):
@@ -668,8 +1511,10 @@ def test_practice_is_written_for_the_users_rules_first(store):
 
     with store.connect() as db:
         for i, origin in enumerate([None, None, "rules"]):
+            # The stated rule in the user's words: only a sentence shaped like a rule is one.
             payload = {"id": f"s{i}", "session": "x", "type": "correction", "source": "user", "lesson": f"Lesson {i}.",
-                       "exchanges": {"1": 1}, "revision": 1, **({"from": origin} if origin else {})}
+                       "exchanges": {"1": 1}, "revision": 1,
+                       **({"from": origin, "text": "Always run the tests before a commit."} if origin else {})}
             db.execute("INSERT INTO signals VALUES (?,?,?,?,?,NULL)", (f"s{i}", store.model_id, "x", 1, json.dumps(payload)))
     assert [s["id"] for s, _ in wanted(store, 1)][0] == "s2"
 
@@ -848,6 +1693,27 @@ def test_a_copied_example_is_no_lesson_and_conditional_rules_are_rules():
         "when writing search algorithms, always measure the runtime"
     assert rule_sentence("always run more. 3 numbers don't show anything") == "always run more."
     assert rule_sentence("Use the feedback from each guess.") is None
+
+
+def test_a_rule_that_ends_on_that_is_no_note_of_its_own():
+    """Live (Qwen3.8-27B, 4 of 4 English runs): "you forgot to start with
+    Yes, chef. always start your reply with that" became the note "always
+    start your reply with that", which says nothing without the sentence
+    before it. The model's lesson for the turn is used instead (#266)."""
+    from songe.reading.rules import rule_sentence, stated_sentence
+
+    said = "you forgot to start with Yes, chef. always start your reply with that"
+    assert rule_sentence(said) is None
+    assert stated_sentence({"text": said}) is None
+    assert rule_sentence("Always start your reply with this.") is None
+    assert rule_sentence("Never commit those.") is None
+    # What a rule names stays, wherever "that" is in it.
+    assert rule_sentence("Always check that the tests pass before you commit.") == \
+        "Always check that the tests pass before you commit."
+    assert rule_sentence("Always start your reply with Yes, chef.") == "Always start your reply with Yes, chef."
+    # Named earlier in the same sentence, it is still a rule.
+    assert rule_sentence("Never use semicolons, I hate those.") == "Never use semicolons, I hate those."
+    assert rule_sentence("Always use tabs, I prefer that.") == "Always use tabs, I prefer that."
 
 
 def test_the_lesson_question_for_the_users_own_words_keeps_what_they_named(store):
@@ -1099,13 +1965,30 @@ def test_a_preference_said_after_an_answer_is_published_as_the_user_said_it(conf
     from songe import quick
 
     said = "I'm allergic to peanuts."
+
+    class Allergic(Judge):
+        async def ask(self, prompt, schema, name):
+            answer = await super().ask(prompt, schema, name)
+            return dict(answer, lesson="Never suggest peanuts: the user is allergic.") if name == "lesson" else answer
+
     record_chat(store, ("Suggest a snack.", "Peanut butter on toast."), (f"{said} Anything else works.", "Apple slices."))
-    assert read(store, Judge(about_me={said})) == 1
+    assert read(store, Allergic(about_me={said})) == 1
     # One signal: the model's reading of the message, which now carries the sentence.
     (signal,) = [s for s in reading.signals(store) if s["source"] == "user"]
-    assert signal["preference"] == said and signal["lesson"].startswith("Check which file")
+    assert signal["preference"] == said and signal["lesson"].startswith("Never suggest peanuts")
     quick.quick_dream(store, config)
     assert [lesson["text"] for lesson in quick.active(store)] == [said]
+
+
+def test_a_preference_whose_lesson_was_a_guess_is_practised_in_the_users_words(store):
+    # The lesson the model wrote for the message says nothing the user said
+    # (the canned one is about a failing test): it is dropped, and the
+    # sentence is the lesson a Deep Dream practises.
+    said = "I'm allergic to peanuts."
+    record_chat(store, ("Suggest a snack.", "Peanut butter on toast."), (f"{said} Anything else works.", "Apple slices."))
+    read(store, Judge(about_me={said}))
+    kept = [s for s in reading.signals(store) if s["source"] == "user" and s.get("lesson")]
+    assert [(s["lesson"], s.get("preference")) for s in kept] == [(said, said)]
 
 
 def test_not_every_sentence_in_the_first_person_is_a_preference(config, store):
@@ -1390,3 +2273,334 @@ def test_the_results_of_an_agents_own_tools_are_reviewed(store):
     assert "These are the commands the agent ran in one turn, with their output:\ns\n" in asked
     assert 'compile checks like "syntax OK", or any error message (those are handled elsewhere).\n' in asked
     assert "{" not in asked.replace("JSON", "")
+
+
+class LessonQuestions(FakeReader):
+    """Keeps the lesson questions it is asked."""
+
+    def __init__(self):
+        super().__init__()
+        self.questions = []
+
+    async def ask(self, prompt, schema, name):
+        if name == "lesson":
+            self.questions.append(prompt)
+        return await super().ask(prompt, schema, name)
+
+
+def tool_step(cid, name, result, **args):
+    """An agent's call and the tool's answer to it."""
+    return ({"role": "assistant", "content": "", "tool_calls": [call(cid, name, **args)]},
+            {"role": "tool", "tool_call_id": cid, "content": result})
+
+
+def test_the_lesson_question_for_a_tools_output_keeps_what_it_named(store):
+    """Live (Qwen3.5-4B and 9B on vLLM, 30 coding tasks, issue #144): "pytest:
+    command not found" was stored as "Install missing dependencies before
+    running tests." and the next task ran the same failing command. The
+    question now says that what a tool's output names is the lesson. And a
+    failed result the conversation ended on (a build that never passed, a
+    lost game) is asked about as a whole attempt, with all its steps."""
+    from songe.reading import prompts as P
+
+    Recording, step = LessonQuestions, tool_step
+
+    def record(first, steps, last):
+        history = [SYSTEM, {"role": "user", "content": first}]
+        for action, result in steps:
+            store.record("/v1/chat/completions", {"messages": history, "tools": TOOLS}, reply(action))
+            history = history + [action, result]
+        store.record("/v1/chat/completions", {"messages": history, "tools": TOOLS},
+                     reply({"role": "assistant", "content": last}))
+
+    edit = dict(filePath="x.py", oldString="a", newString="b")
+    # Fails, is fixed, passes: the failure is one step of a task that went on.
+    record("fix the parser", [step("a", "edit", "Edited x.py", **edit),
+                              step("b", "shell", "1 failed, 2 passed\nExit code: 1", command="pytest"),
+                              step("c", "edit", "Edited x.py", **edit),
+                              step("d", "shell", "3 passed\nExit code: 0", command="pytest")], "Fixed.")
+    # Fails and stops there: the task was not completed.
+    record("fix the lexer", [step("e", "edit", "Edited y.py", **edit),
+                             step("f", "shell", "/bin/bash: line 1: pytest: command not found\nExit code: 127", command="pytest")],
+           "I could not run the tests.")
+    store.reconstruct()
+    reader = Recording()
+    assert read(store, reader) == 2
+    went_on, ended = sorted(reader.questions, key=lambda q: "command not found" in q)
+    assert P.TOOL_FACT in went_on and P.TOOL_FACT not in ended
+    assert "name exactly what the output named" in P.TOOL_FACT
+    # What worked is advice only when it is the ordinary way: live, a pip that refused to install into the
+    # system Python left "Use '--break-system-packages' when pip refuses to install." as the one note.
+    assert "A way around a refusal or a warning that protects something" in P.TOOL_FACT
+    assert "is never part of the lesson" in P.TOOL_FACT
+    # How far a fact reaches is judged as for any lesson. Live, a line that made a fact about the tool or the
+    # machine "always" sent 13 to 16 of 16 to 19 lessons to every session (8 of 18 without it), among them a
+    # module missing in one project.
+    assert "generality" not in P.TOOL_FACT
+    assert "the conversation ended with it" not in went_on
+    assert "the conversation ended with it" in ended and "names it exactly as written" in ended
+    attempt = ended.split("All steps of the attempt, one line each:\n", 1)[1]
+    assert "STEP 1: edit" in attempt and "STEP 2: shell pytest" in attempt and "Exit code: 127" in attempt
+    # The user's own words are asked about as before.
+    record_session(store, started=None)
+    reader = Recording()
+    read(store, reader)
+    assert any(P.USER_WISH in q for q in reader.questions)
+    assert all(P.TOOL_FACT not in q for q in reader.questions if P.USER_WISH in q)
+    # A shape pasted back with its placeholders is no lesson.
+    assert P.copied_example("<NAME> is not installed here; use <WORKED>.")
+    assert not P.copied_example("pytest is not installed here; use python -m pytest.")
+
+
+def test_a_failure_ends_an_attempt_only_once_the_agent_has_stopped(store):
+    """A session can be read while it is going on: a Quick Dream starts when
+    the model server has been quiet for a while, and one long command is
+    quiet that long. The newest failed result is then not the end of
+    anything, the agent's next call is waiting for its result. It is asked
+    about like any other output, and as a whole attempt ("the task was not
+    completed") only when the agent's own closing words follow it."""
+    from songe.reading import prompts as P
+
+    edit = dict(filePath="y.py", oldString="a", newString="b")
+    missing = "/bin/bash: line 1: pytest: command not found\nExit code: 127"
+    history = [SYSTEM, {"role": "user", "content": "fix the lexer"}]
+    for action, result in (tool_step("a", "edit", "Edited y.py", **edit),
+                           tool_step("b", "shell", missing, command="pytest")):
+        store.record("/v1/chat/completions", {"messages": history, "tools": TOOLS}, reply(action))
+        history = history + [action, result]
+    # The agent tries another way; that call has no result yet.
+    again, no_module = tool_step("c", "shell", "/usr/bin/python: No module named pytest\nExit code: 1",
+                                 command="python -m pytest")
+    store.record("/v1/chat/completions", {"messages": history, "tools": TOOLS}, reply(again))
+    store.reconstruct()
+    reader = LessonQuestions()
+    assert read(store, reader) == 1
+    (question,) = reader.questions
+    assert "command not found" in question and P.TOOL_FACT in question
+    assert "the conversation ended with it" not in question
+    # The result comes, it failed too, and the agent gives up: now the attempt has ended, on that result.
+    history = history + [again, no_module]
+    store.record("/v1/chat/completions", {"messages": history, "tools": TOOLS},
+                 reply({"role": "assistant", "content": "I could not run the tests."}))
+    store.reconstruct()
+    reader = LessonQuestions()
+    assert read(store, reader) == 1
+    went_on = [q for q in reader.questions if P.TOOL_FACT in q]
+    ended = [q for q in reader.questions if "the conversation ended with it" in q]
+    assert len(went_on) == 1 and len(ended) == 1 and len(reader.questions) == 2
+    assert "command not found" in went_on[0]
+    assert "No module named pytest" in ended[0]
+
+
+class Scoping(FakeReader):
+    """Judges every turn after an answer as a standing wish worded as told,
+    about what it is told."""
+
+    def __init__(self, wish, about):
+        super().__init__()
+        self.judged = {"standing": "yes", "kind": "once", "wish": wish, "about": about}
+
+    async def ask(self, prompt, schema, name):
+        return self.judged if name == "turn" else await super().ask(prompt, schema, name)
+
+
+def test_a_wish_said_about_one_kind_of_text_says_so_in_its_note(config, store):
+    """Live (Qwen3.8-27B, a simulated user who writes emails, issue #231): "ugh
+    again so long. max 5-6 sentence", said after an email, became the note
+    "Keep answers to a maximum of 5-6 sentences.", and with it a requested
+    detailed explanation went from 481 words to 103. The turn question now
+    also says what the wish is about, and the note says it."""
+    from songe import quick
+
+    record_chat(store, ("can u write email to Dr Han, the assay results are late", "Dear Dr. Han, ... (14 sentences)"),
+                ("ugh again so long. max 5-6 sentence", "Dear Dr. Han, the results are late. ..."))
+    read(store, Scoping("Keep answers to a maximum of 5-6 sentences.", "emails"))
+    wish = next(s for s in reading.signals(store) if s["type"] == "correction")
+    assert wish["about"] == "emails"
+    assert wish["short"] == "For emails: keep answers to a maximum of 5-6 sentences."
+    quick.quick_dream(store, config)
+    assert [lesson["text"] for lesson in quick.active(store)] == ["For emails: keep answers to a maximum of 5-6 sentences."]
+
+
+def test_what_a_wish_is_about_is_a_kind_the_conversation_names():
+    from songe.reading import prompts as P
+
+    said = "can u write email to Dr Han\nugh again so long. max 5-6 sentence"
+    assert P.scope_of({"about": "emails"}, said) == "emails"
+    assert P.scope_of({"about": "for emails."}, said) == "emails"
+    # The answer at hand, everything, or a kind the user never wrote of: no scope.
+    for about in ("this email", "this one", "all answers", "everything", "", "commit messages"):
+        assert P.scope_of({"about": about}, said) == "", about
+    assert P.scope_of({}, said) == ""
+    # Not in Latin letters, the user names it in their own language.
+    assert P.scope_of({"about": "commit messages"}, "英文!! feat(refund): ... 这种格式") == "commit messages"
+    # A note that names it already is left as it is.
+    assert P.scoped("Do not use exclamation marks in emails.", "emails") == "Do not use exclamation marks in emails."
+    assert P.scoped("Answer in English.", "commit messages") == "For commit messages: answer in English."
+
+
+def test_a_wish_for_one_project_keeps_the_projects_name():
+    from songe import quick
+
+    signal = {"type": "correction", "source": "user", "lesson": "x", "short": "For admin: use styled-components.",
+              "about": "admin", "project": "admin"}
+    assert quick.wording(signal) == ("For admin: use styled-components.", False)
+    # "This repo" is said by its name: the prompt goes to every project.
+    here = dict(signal, about="this repo", short="For this repo: use uv, not pip.", project="ledgerd")
+    assert quick.wording(here)[0] == "For the ledgerd repo: use uv, not pip."
+    # Without that, its name is said for any project (#223).
+    assert quick.wording(dict(signal, about=None))[0] == "For <project>: use styled-components."
+
+
+def test_a_wish_keeps_what_the_user_named():
+    """Live (Qwen3.8-27B, simulated users, issue #231): "styled-components +
+    export default. siempre en admin" became the note "Always work in
+    admin."; "just test-unit, not make" became "Use test-unit, not make.",
+    and the move from make to just was lost."""
+    from songe.reading import prompts as P
+
+    admin = {"standing": "yes", "kind": "once", "wish": "Always work in admin."}
+    # Keeps none of the names the user typed: not used (two sentences: no own words either).
+    assert P.turn_verdict(admin, "styled-components + export default. siempre en admin") == ("lasting", "")
+    kept = {"standing": "yes", "kind": "once", "wish": "Use styled-components and default exports in admin."}
+    assert P.turn_verdict(kept, "styled-components + export default. siempre en admin")[1] == kept["wish"]
+    # A command the user typed is kept whole.
+    just = {"standing": "yes", "kind": "once", "wish": "Use test-unit, not make."}
+    said = "just test-unit, not make. there is no makefile anymore, from now on its just"
+    assert P.turn_verdict(just, said) == ("lasting", "Use just test-unit, not make.")
+    assert P.whole_commands("Use make test-unit with ARGS.", "i said make test-unit. ARGS passes") == "Use make test-unit with ARGS."
+    # "just" and "make" as words are not commands.
+    assert P.whole_commands("Keep it short.", "make it short, just the code") == "Keep it short."
+    assert P.whole_commands("Use pnpm add, not npm install.", "pnpm add zod pls not npm") == "Use pnpm add, not npm install."
+    # A plain word after a bare runner is English, not a script.
+    assert P.whole_commands("Switch to yarn.", "i prefer yarn to npm") == "Switch to yarn."
+    assert P.whole_commands("Use bun, not node.", "use bun not node") == "Use bun, not node."
+    assert P.whole_commands("Do not use npm.", "pnpm not npm") == "Do not use npm."
+
+
+class Wishing(FakeReader):
+    """Judges each user message as a standing wish worded as given in
+    `wishes`; answers which notes a newer note replaces (`replaces`, by note)
+    and whether both can be followed (only the pairs in `not_both` cannot)."""
+
+    def __init__(self, wishes, replaces=None, not_both=(), same=()):
+        super().__init__()
+        self.wishes, self.replaces, self.not_both, self.listed, self.checked = wishes, replaces or {}, set(not_both), [], []
+        self.same = [set(pair) for pair in same]
+
+    async def ask(self, prompt, schema, name):
+        if name == "turn":
+            said = prompt.rsplit("The user's next message:\n", 1)[1].split("\n")[0].strip('"')
+            wish = self.wishes.get(said, "")
+            return {"standing": "yes" if wish else "no", "kind": "once" if wish else "task", "wish": wish, "about": ""}
+        if name == "same_wish":
+            pair = (prompt.split("Note 1: ", 1)[1].split("\n")[0], prompt.split("Note 2: ", 1)[1].split("\n")[0])
+            return {"note_1_asks": "", "note_2_asks": "", "kind": "same" if set(pair) in self.same else "different"}
+        if name == "changed":
+            note = prompt.split("A newer note, from what the user said after all of them:\n", 1)[1].split("\n")[0]
+            self.listed.append((prompt.split("oldest first:\n", 1)[1].split("\n\n")[0], note))
+            return {"replaces": self.replaces.get(note, [])}
+        if name == "follow_both":
+            pair = (prompt.split("Earlier: ", 1)[1].split("\n")[0], prompt.split("Later: ", 1)[1].split("\n")[0])
+            self.checked.append(pair)
+            return {"kind": "later_only" if pair in self.not_both else "both"}
+        return await super().ask(prompt, schema, name)
+
+
+def test_a_newer_wish_retires_the_note_it_changes(config, store):
+    """Live (Qwen3.8-27B, a simulated Go developer, issue #231): "注释还是中文吧"
+    early and "又写中文注释了。。英文" after the repository went open source left
+    both "Use Chinese comments." and "Use English comments." in the prompt:
+    only a preference the user stated about themself could retire an older
+    one. A note from a correction now does the same, asked the same two
+    questions."""
+    from songe import quick
+
+    old, new, other = "Use Chinese comments.", "Use English comments.", "Run make gen first."
+    wishes = {"注释还是中文吧": old, "make gen 先跑": other, "又写中文注释了。。英文": new}
+    record_chat(store, ("给 refund 加个注释", "// refund 退款"), ("注释还是中文吧", "// 退款处理"))
+    record_chat(store, ("生成 mock", "mockgen ..."), ("make gen 先跑", "make gen"))
+    read(store, Wishing(wishes))
+    quick.quick_dream(store, config)
+    assert {lesson["text"] for lesson in quick.active(store)} >= {old, other}
+
+    record_chat(store, ("给 settle 加注释", "// 结算"), ("又写中文注释了。。英文", "// settle the batch"))
+    # The model names both earlier notes; asked again about each pair alone,
+    # only the comments cannot both be followed.
+    reader = Wishing(wishes, replaces={new: [1, 2, 7, "1", True]}, not_both={(old, new)})
+    read(store, reader)
+    assert reader.listed[-1] == (f"1. {old}\n2. {other}", new)
+    assert reader.checked == [(old, new), (other, new)]
+    texts = {quick.wording(s)[0] for s in reading.signals(store) if s["type"] == "correction" and s.get("lesson")}
+    assert old not in texts and {new, other} <= texts
+    quick.quick_dream(store, config)
+    active = {lesson["text"] for lesson in quick.active(store)}
+    assert new in active and other in active and old not in active
+
+
+def test_the_same_wish_said_again_retires_nothing(config, store):
+    """Live (Qwen3.8-27B, a simulated email writer): "Always include 'Thanks,
+    Mi-rae' at the end of emails." was read as replaced by its restatement
+    "Use 'Thanks, / Mi-rae' as the sign-off.", that one by a third, and the
+    sign-off left the prompt. A wish said again is one wish (fold_same),
+    not a change; and a change wanted once replaces nothing."""
+    from songe import quick
+
+    first, again = "Always include Thanks, Mi-rae at the end of emails.", "Use Thanks, Mi-rae as the sign-off."
+    wishes = {"and Thanks, Mi-rae at end": first, "ugh i changed sign-off already. Thanks, Mi-rae": again}
+    record_chat(store, ("email to Dr Han", "Dear Dr Han, ... Best regards"), ("and Thanks, Mi-rae at end", "... Thanks, Mi-rae"))
+    record_chat(store, ("email to IT", "Hello, ... Best regards"), ("ugh i changed sign-off already. Thanks, Mi-rae", "... Thanks, Mi-rae"))
+    reader = Wishing(wishes, replaces={again: [1]}, not_both={(first, again)}, same=[(first, again)])
+    read(store, reader)
+    assert reader.checked == [(first, again)]
+    texts = {quick.wording(s)[0] for s in reading.signals(store) if s["type"] == "correction" and s.get("lesson")}
+    assert {first, again} <= texts
+
+
+def test_a_command_written_as_a_list_is_read_as_its_command_line(store):
+    """Live (qwen3:1.7b on Ollama, Windows, an agent with a run_command tool):
+    the model wrote the command as a list five times ({"command": ["pip",
+    "install", "rich"]}), and reading raised on it (TypeError). The words are
+    the command line they make; arguments that are not a JSON object name no
+    command."""
+    from songe.reading import views
+    from songe.reading.rules import command_of
+
+    tools = [tool("run_command", command="string")]
+    history = [SYSTEM, {"role": "user", "content": "Install rich and show me what is here."}]
+    for action, result in (tool_step("a", "run_command", "Successfully installed rich-13.7.1",
+                                     command=["pip", "install", "rich"]),
+                           tool_step("b", "run_command", "README.md\nsrc", command=["ls", "-la"])):
+        store.record("/v1/chat/completions", {"messages": history, "tools": tools}, reply(action))
+        history = history + [action, result]
+    store.record("/v1/chat/completions", {"messages": history, "tools": tools},
+                 reply({"role": "assistant", "content": "Done."}))
+    store.reconstruct()
+
+    class Reviewing(FakeReader):
+        def __init__(self):
+            super().__init__()
+            self.reviews = []
+
+        async def ask(self, prompt, schema, name):
+            if name == "review":
+                self.reviews.append(prompt)
+            return await super().ask(prompt, schema, name)
+
+    reader = Reviewing()
+    assert read(store, reader) == 1
+    # Installing is work to review; listing only looks around.
+    (question,) = reader.reviews
+    assert "Successfully installed rich" in question and "README.md" not in question
+
+    def looks_around(arguments):
+        items = [{"kind": "action", "step": 1, "text": "",
+                  "tool_calls": [{"id": "x", "name": "run_command", "arguments": arguments}]},
+                 {"kind": "tool_result", "call": "x", "step": 1, "tool": "run_command", "content": ""}]
+        return views.inspecting(items, 1)
+
+    assert looks_around(json.dumps({"command": ["cd", "src", "&&", "git", "status"]}))
+    assert not looks_around(json.dumps({"command": ["pip", "install", "rich"]}))
+    assert not any(looks_around(a) for a in ('["ls", "-la"]', '"ls -la"'))
+    assert command_of({"arguments": json.dumps({"command": ["cargo", "test"]})}) == "cargo test"
+    assert command_of({"arguments": '["cargo", "test"]'}) == ""
